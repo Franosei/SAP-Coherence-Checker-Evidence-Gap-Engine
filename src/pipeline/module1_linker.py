@@ -91,6 +91,7 @@ from src.pipeline.config import (
     LINKAGE_JACCARD_HIGH,
     LINKAGE_JACCARD_MEDIUM,
 )
+from src.pipeline.article_classifier import ArticleVerdict, classify_article
 from src.pipeline.pubmed_client import PubMedClient, PubMedRecord, jaccard_token_similarity
 
 logger = logging.getLogger(__name__)
@@ -446,6 +447,97 @@ def fetch_hfref_trials(max_records: Optional[int] = None) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Results-paper gate helper
+# ---------------------------------------------------------------------------
+
+def _fetch_and_gate(
+    pmid: str,
+    nct_id: str,
+    client: PubMedClient,
+) -> tuple[Optional[PubMedRecord], str]:
+    """
+    Fetch a PubMed record and immediately run the article-type gate on it.
+
+    This is the single integration point between the linkage cascade and the
+    article classifier.  Every candidate PMID passes through this function
+    before being accepted as a valid link.
+
+    Parameters
+    ----------
+    pmid:
+        Candidate PubMed identifier to fetch and classify.
+    nct_id:
+        NCT ID of the trial being linked (used only for logging).
+    client:
+        Authenticated :class:`PubMedClient` instance.
+
+    Returns
+    -------
+    tuple[Optional[PubMedRecord], str]
+        ``(record, gate_note)`` where:
+
+        - ``record`` is the :class:`PubMedRecord` if the article passed the
+          gate (ACCEPT or UNCERTAIN), or ``None`` if definitively REJECTED.
+        - ``gate_note`` is a human-readable string summarising the gate
+          decision, for inclusion in the linkage audit log ``notes`` field.
+          For UNCERTAIN results the note includes the flag so the reviewer
+          knows to check the article type.
+
+    Notes
+    -----
+    REJECT with ``confidence="high"`` → returns ``(None, note)`` so the
+    cascade skips this PMID and tries the next candidate.
+
+    REJECT with ``confidence="medium"`` or UNCERTAIN → returns
+    ``(record, note)`` with the note flagging the uncertainty.  The cascade
+    stores this as Low/Medium confidence so the human reviewer is prompted.
+    """
+    try:
+        record = client.fetch_record(pmid)
+    except Exception as exc:
+        return None, f"Fetch failed for PMID {pmid}: {exc}"
+
+    classification = classify_article(record)
+
+    gate_note = (
+        f"[Article gate: {classification.verdict.value.upper()} | "
+        f"type={classification.article_type.value} | "
+        f"conf={classification.confidence} | "
+        f"tier={classification.tier}] "
+        f"{classification.reason}"
+    )
+
+    if (classification.verdict == ArticleVerdict.REJECT
+            and classification.confidence == "high"):
+        # Definitive rejection — discard this PMID entirely
+        logger.info(
+            "  %s — PMID %s REJECTED (high confidence): %s",
+            nct_id, pmid, classification.reason,
+        )
+        return None, gate_note
+
+    if classification.verdict == ArticleVerdict.REJECT:
+        # Medium-confidence rejection — keep but flag
+        logger.warning(
+            "  %s — PMID %s rejected (medium confidence, flagged): %s",
+            nct_id, pmid, classification.reason,
+        )
+        # Return record so it can be stored as Low confidence + human review flag
+        return record, gate_note
+
+    if classification.verdict == ArticleVerdict.UNCERTAIN:
+        logger.info(
+            "  %s — PMID %s article type UNCERTAIN — flagged for review: %s",
+            nct_id, pmid, classification.reason,
+        )
+        return record, gate_note
+
+    # ACCEPT
+    logger.debug("  %s — PMID %s accepted as results paper.", nct_id, pmid)
+    return record, gate_note
+
+
+# ---------------------------------------------------------------------------
 # Step B — NCT-to-PMID linkage cascade
 # ---------------------------------------------------------------------------
 
@@ -635,19 +727,20 @@ def _cascade_link(
     # Stage 0 — CT.gov investigator-submitted RESULT PMID                #
     # ------------------------------------------------------------------ #
     if ctgov_pmid:
-        try:
-            record = client.fetch_record(ctgov_pmid)
+        record, gate_note = _fetch_and_gate(ctgov_pmid, nct_id, client)
+        if record is not None:
             return (
                 ctgov_pmid,
                 LinkageMethod.DIRECT,
                 LinkageConfidence.HIGH,
-                f"CT.gov RESULT reference PMID {ctgov_pmid} fetched successfully.",
+                f"CT.gov RESULT reference PMID {ctgov_pmid} fetched successfully. {gate_note}",
                 record,
             )
-        except (requests.RequestException, Exception) as exc:
+        else:
             logger.warning(
-                "  %s — Stage 0: CT.gov PMID %s fetch failed (%s). Proceeding to Stage 1.",
-                nct_id, ctgov_pmid, exc,
+                "  %s — Stage 0: CT.gov PMID %s gated out or fetch failed (%s). "
+                "Proceeding to Stage 1.",
+                nct_id, ctgov_pmid, gate_note,
             )
 
     # ------------------------------------------------------------------ #
@@ -660,20 +753,21 @@ def _cascade_link(
         pmids = []
 
     if len(pmids) == 1:
-        # Single unambiguous result → High confidence
-        try:
-            record = client.fetch_record(pmids[0])
+        # Single unambiguous result → High confidence (subject to article gate)
+        record, gate_note = _fetch_and_gate(pmids[0], nct_id, client)
+        if record is not None:
             return (
                 pmids[0],
                 LinkageMethod.DIRECT,
                 LinkageConfidence.HIGH,
-                f"Single direct NCT ID match in PubMed (PMID {pmids[0]}).",
+                f"Single direct NCT ID match in PubMed (PMID {pmids[0]}). {gate_note}",
                 record,
             )
-        except requests.RequestException as exc:
+        else:
             logger.warning(
-                "  %s — Stage 1: record fetch failed for PMID %s: %s",
-                nct_id, pmids[0], exc,
+                "  %s — Stage 1: PMID %s gated out or fetch failed (%s). "
+                "Proceeding to Stage 2.",
+                nct_id, pmids[0], gate_note,
             )
 
     if len(pmids) > 1:
@@ -700,15 +794,18 @@ def _cascade_link(
         logger.warning("  %s — Stage 2: title search error: %s", nct_id, exc)
         candidate_pmids = []
 
-    best_pmid  = ""
-    best_score = 0.0
+    best_pmid      = ""
+    best_score     = 0.0
     best_record: Optional[PubMedRecord] = None
+    best_gate_note = ""
 
     for candidate_pmid in candidate_pmids:
-        try:
-            record = client.fetch_record(candidate_pmid)
-        except requests.RequestException as exc:
-            logger.debug("  %s — Stage 2: fetch failed for candidate %s: %s", nct_id, candidate_pmid, exc)
+        record, gate_note = _fetch_and_gate(candidate_pmid, nct_id, client)
+        if record is None:
+            # High-confidence article-type rejection or fetch failure — skip candidate
+            logger.debug(
+                "  %s — Stage 2: PMID %s gated out: %s", nct_id, candidate_pmid, gate_note
+            )
             continue
 
         score = jaccard_token_similarity(title, record.title)
@@ -717,17 +814,21 @@ def _cascade_link(
         )
 
         if score > best_score:
-            best_score  = score
-            best_pmid   = candidate_pmid
-            best_record = record
+            best_score     = score
+            best_pmid      = candidate_pmid
+            best_record    = record
+            best_gate_note = gate_note
 
     if best_score >= LINKAGE_JACCARD_HIGH:
         return (
             best_pmid,
             LinkageMethod.FUZZY,
             LinkageConfidence.HIGH,
-            f"Title Jaccard={best_score:.3f} ≥ {LINKAGE_JACCARD_HIGH} (High threshold). "
-            f"Matched to: {best_record.title[:80] if best_record else ''}",
+            (
+                f"Title Jaccard={best_score:.3f} ≥ {LINKAGE_JACCARD_HIGH} (High threshold). "
+                f"Matched to: {best_record.title[:80] if best_record else ''}. "
+                f"{best_gate_note}"
+            ),
             best_record,
         )
 
@@ -736,12 +837,13 @@ def _cascade_link(
         # Stage 3 — Author + year disambiguation                          #
         # ---------------------------------------------------------------- #
         return _author_year_disambiguate(
-            nct_id          = nct_id,
-            completion_date = completion_date,
-            candidate_pmid  = best_pmid,
+            nct_id           = nct_id,
+            completion_date  = completion_date,
+            candidate_pmid   = best_pmid,
             candidate_record = best_record,
-            jaccard_score   = best_score,
-            client          = client,
+            jaccard_score    = best_score,
+            gate_note        = best_gate_note,
+            client           = client,
         )
 
     # ------------------------------------------------------------------ #
@@ -763,6 +865,7 @@ def _author_year_disambiguate(
     candidate_record: Optional[PubMedRecord],
     jaccard_score: float,
     client: PubMedClient,
+    gate_note: str = "",
 ) -> tuple[str, LinkageMethod, LinkageConfidence, str, Optional[PubMedRecord]]:
     """
     Stage 3 — Author + year disambiguation for medium-confidence title matches.
@@ -789,6 +892,9 @@ def _author_year_disambiguate(
         The Jaccard similarity that placed this candidate in the medium band.
     client:
         :class:`PubMedClient` for additional fetches if needed.
+    gate_note:
+        Article-type gate verdict string from :func:`_fetch_and_gate`, forwarded
+        from Stage 2 and appended to the linkage notes for the audit log.
 
     Returns
     -------
@@ -805,7 +911,7 @@ def _author_year_disambiguate(
             None,
         )
 
-    pub_year    = candidate_record.pub_year
+    pub_year     = candidate_record.pub_year
     first_author = candidate_record.authors[0] if candidate_record.authors else ""
 
     # Extract expected year from completion_date (handles "2021-06", "Jun 2021", "2021")
@@ -814,6 +920,8 @@ def _author_year_disambiguate(
 
     year_ok = bool(expected_year and pub_year and abs(int(pub_year) - int(expected_year)) <= 2)
     # Allow ±2 years to account for delayed publication and early termination
+
+    gate_suffix = f" {gate_note}" if gate_note else ""
 
     if year_ok:
         return (
@@ -824,7 +932,7 @@ def _author_year_disambiguate(
                 f"Stage 3 author+date disambiguation: Jaccard={jaccard_score:.3f}, "
                 f"pub_year={pub_year} within ±2 of completion_year={expected_year}, "
                 f"first_author={first_author!r}. "
-                f"Matched to: {candidate_record.title[:80]}"
+                f"Matched to: {candidate_record.title[:80]}.{gate_suffix}"
             ),
             candidate_record,
         )
@@ -836,7 +944,7 @@ def _author_year_disambiguate(
         (
             f"Stage 3 year mismatch: pub_year={pub_year!r} vs "
             f"expected≈{expected_year!r} (completion_date={completion_date!r}). "
-            f"Jaccard={jaccard_score:.3f}. Human review required."
+            f"Jaccard={jaccard_score:.3f}. Human review required.{gate_suffix}"
         ),
         candidate_record,
     )

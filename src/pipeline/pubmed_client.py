@@ -85,6 +85,12 @@ class PubMedRecord:
         Journal name (MedlineTA abbreviation preferred, full title fallback).
     mesh_terms:
         MeSH descriptor names, useful for endpoint domain classification.
+    pub_types:
+        Set of PubMed ``PublicationType`` strings for this article, e.g.
+        ``{"Randomized Controlled Trial", "Multicenter Study"}``.
+        Used by the article-type gate (``article_classifier.py``) to detect
+        protocol papers, systematic reviews, and editorials before they enter
+        the endpoint matching pipeline.
     """
 
     pmid: str
@@ -95,6 +101,7 @@ class PubMedRecord:
     pub_year: str = ""
     journal: str = ""
     mesh_terms: list[str] = field(default_factory=list)
+    pub_types: set[str] = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +381,7 @@ class PubMedClient:
         pub_year = self._parse_pub_year(article, root)
         abstract_sections, abstract_text = self._parse_abstract(article)
         mesh_terms = self._parse_mesh(root)
+        pub_types  = self._parse_pub_types(article)
 
         return PubMedRecord(
             pmid              = pmid,
@@ -384,6 +392,7 @@ class PubMedClient:
             pub_year          = pub_year,
             journal           = journal,
             mesh_terms        = mesh_terms,
+            pub_types         = pub_types,
         )
 
     @staticmethod
@@ -473,3 +482,31 @@ class PubMedClient:
             if name:
                 terms.append(name)
         return terms
+
+    def _parse_pub_types(self, article: ET.Element) -> set[str]:
+        """
+        Parse PubMed ``PublicationType`` tags into a set of strings.
+
+        These tags are the most reliable signal for the article-type gate.
+        Typical values for results papers: ``"Randomized Controlled Trial"``,
+        ``"Clinical Trial, Phase III"``, ``"Multicenter Study"``.
+        Typical values for non-results articles: ``"Study Protocol"``,
+        ``"Meta-Analysis"``, ``"Editorial"``, ``"Letter"``.
+
+        Parameters
+        ----------
+        article:
+            The ``<Article>`` XML element from a parsed PubMed record.
+
+        Returns
+        -------
+        set[str]
+            Publication type strings, stripped of whitespace.  Empty set if
+            the ``<PublicationTypeList>`` element is absent.
+        """
+        types: set[str] = set()
+        for pt_elem in article.findall(".//PublicationTypeList/PublicationType"):
+            pt = self._text(pt_elem)
+            if pt:
+                types.add(pt)
+        return types
