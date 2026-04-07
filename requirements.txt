@@ -1,0 +1,41 @@
+# Core
+python-dotenv>=1.0.0
+
+# Data retrieval
+requests>=2.31.0
+
+# Data management
+pandas>=2.0.0
+numpy>=1.25.0
+
+# Schema validation
+pydantic>=2.0.0
+
+# LLM + Embedding API
+openai>=1.30.0
+
+# Audit logging
+portalocker>=3.2.0
+
+# Bayesian modelling
+pymc>=5.10.0
+arviz>=0.18.0
+
+# Power calculations
+statsmodels>=0.14.0
+scipy>=1.11.0
+
+# Scorecard metrics
+scikit-learn>=1.4.0
+
+# Dashboard
+plotly>=5.20.0
+shiny>=1.5.1
+shinywidgets>=0.7.1
+
+# Testing
+pytest>=8.0.0
+pytest-cov>=5.0.0
+
+# Development
+ruff>=0.4.0

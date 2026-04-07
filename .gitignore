@@ -205,3 +205,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project-specific: never commit API keys or raw data logs
+.env
+data/logs/*.csv
+data/logs/bayes_traces/
+# Gold standard may contain real trial data — commit only the empty schema
+# data/gold_standard/gold_standard.csv  ← kept in version control (schema only)
+
