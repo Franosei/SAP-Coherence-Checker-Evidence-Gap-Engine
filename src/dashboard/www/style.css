@@ -609,11 +609,51 @@ tbody td {
 
 tbody td.wrap { white-space: normal; }
 
-/* DataTables (shiny render_data_frame) overrides */
-.dataTable thead th {
-  background: var(--color-primary) !important;
+/* --------------------------------------------------------------------------
+   DataGrid / DataTable — Shiny render.data_frame (all selector variants)
+   Covers: plain HTML table, DataTables.js, Shiny DataGrid React component.
+   -------------------------------------------------------------------------- */
+
+/* Standard HTML table headers */
+thead tr {
+  background-color: var(--color-primary) !important;
+}
+thead th {
+  background-color: var(--color-primary) !important;
   color: var(--color-text-inverse) !important;
-  border-color: rgba(255,255,255,0.1) !important;
+  border-bottom: 2px solid var(--color-primary-dark) !important;
+  border-right: 1px solid rgba(255, 255, 255, 0.12) !important;
+}
+
+/* DataTables.js (class added by Shiny when DataTable is used) */
+.dataTable thead th,
+.dataTable thead td {
+  background-color: var(--color-primary) !important;
+  color: var(--color-text-inverse) !important;
+  border-color: rgba(255, 255, 255, 0.12) !important;
+}
+
+/* Shiny DataGrid React component (shiny 1.x) — targets the output wrapper */
+[id$="_table"] thead th,
+[id$="_table"] thead tr,
+.shiny-frame-output thead th,
+.shiny-frame-output thead tr,
+.shiny-data-frame-output thead th,
+.shiny-data-frame-output thead tr,
+.shiny-html-output thead th,
+.shiny-html-output thead tr {
+  background-color: var(--color-primary) !important;
+  color: var(--color-text-inverse) !important;
+}
+
+/* Remove DataGrid's default faded/ghost header appearance */
+.shiny-data-frame-output th,
+.shiny-frame-output th,
+.gt_col_heading,
+.gt_column_spanner_outer {
+  background-color: var(--color-primary) !important;
+  color: var(--color-text-inverse) !important;
+  opacity: 1 !important;
 }
 
 /* --------------------------------------------------------------------------

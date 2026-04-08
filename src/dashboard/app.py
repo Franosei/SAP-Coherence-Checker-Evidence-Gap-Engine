@@ -1,5 +1,5 @@
 """
-SAP Coherence Checker — Audit Dashboard.
+SAP Coherence Checker — Audit Dashboard  (v2.0).
 
 Run:
     python -m shiny run --reload --port 8080 src/dashboard/app.py
