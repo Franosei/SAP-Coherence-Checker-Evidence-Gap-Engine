@@ -63,12 +63,15 @@ from src.pipeline.config import (
 from src.pipeline.hr_extractor import extract_effect_measures
 from src.pipeline.module1_linker import fetch_hfref_trials, link_to_pubmed
 from src.pipeline.module2_endpoint_matcher import run_endpoint_matching
+from src.pipeline.module4_power_audit import run_power_audit
+from src.pipeline.scorecard import build_scorecard, cluster_endpoints
 
 OUTPUT_DIR           = OUTPUTS_DIR
 TRIALS_PATH          = OUTPUT_DIR / "trials.csv"
 LINKED_TRIALS_PATH   = OUTPUT_DIR / "linked_trials.csv"
 MATCHED_TRIALS_PATH  = OUTPUT_DIR / "matched_trials.csv"
 EFFECT_MEASURES_PATH = OUTPUT_DIR / "effect_measures.json"
+SCORECARD_PATH       = OUTPUT_DIR / "scorecard.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -321,61 +324,182 @@ def step4_extract_hr(linked: pd.DataFrame) -> None:
         )
 
 
-def step5_bayesian(skip: bool) -> None:
+def step5_bayesian(skip: bool, trials: pd.DataFrame) -> list[dict]:
     """
-    Step 5 — Bayesian sequential meta-analysis (Module 3).
+    Step 5 — Bayesian sequential meta-analysis (Module 3) + power audit (Module 4).
 
-    Loads :class:`EffectMeasure` objects from ``effect_measures.json``,
-    filters to human-confirmed poolable pairs from the decision log, and
-    fits the random-effects Bayesian model incrementally.
+    Loads EffectMeasure objects from ``effect_measures.json``, filters to
+    human-confirmed poolable pairs, fits the random-effects Bayesian model
+    sequentially (one trial at a time in registration-date order), then
+    immediately runs the power audit so that optimism bias can be computed
+    against the posterior available at each trial's registration date.
 
-    Skipped when ``--skip-bayesian`` is set (useful when the human review
-    queue has not been cleared yet) or when no poolable effect measures exist.
+    Returns
+    -------
+    list[dict]
+        Sequential analysis results (one dict per trial added). Empty list
+        if skipped or no poolable pairs are available.
     """
     if skip:
         logging.info("Step 5 — Bayesian model skipped (--skip-bayesian).")
-        return
+        return []
 
     if not EFFECT_MEASURES_PATH.exists():
-        logging.warning(
-            "Step 5 — %s not found. Run Step 4 first.", EFFECT_MEASURES_PATH
-        )
-        return
+        logging.warning("Step 5 — %s not found. Run Step 4 first.", EFFECT_MEASURES_PATH)
+        return []
 
     if not DECISION_LOG_PATH.exists():
-        logging.warning(
-            "Step 5 — Decision log not found. Complete Steps 3–4 first."
-        )
-        return
+        logging.warning("Step 5 — Decision log not found. Complete Steps 3-4 first.")
+        return []
 
     from src.models.schemas import EffectMeasure
     from src.pipeline.module3_bayesian import load_poolable_effects, run_sequential_analysis
 
-    raw_data = json.loads(EFFECT_MEASURES_PATH.read_text(encoding="utf-8"))
+    raw_data     = json.loads(EFFECT_MEASURES_PATH.read_text(encoding="utf-8"))
     all_measures = [EffectMeasure(**item) for item in raw_data]
 
     poolable_df = load_poolable_effects(all_measures)
     if poolable_df.empty:
         logging.info(
-            "Step 5 — No human-confirmed poolable pairs in the decision log yet. "
-            "Complete the human review queue in the dashboard first."
+            "Step 5 — No human-confirmed poolable pairs yet. "
+            "Clear the Review Queue in the dashboard, then re-run."
         )
-        return
+        return []
 
     logging.info(
         "Step 5 — Fitting Bayesian sequential meta-analysis on %d poolable pairs...",
         len(poolable_df),
     )
-    results = run_sequential_analysis(poolable_df)
-    final   = results[-1]
+    sequential_results = run_sequential_analysis(poolable_df)
+    final = sequential_results[-1]
     logging.info(
-        "  Final pooled HR = %.3f (95%% CrI %.3f–%.3f), tau = %.3f  [n=%d trials]",
+        "  Final pooled HR = %.3f (95%% CrI %.3f-%.3f), tau = %.3f  [n=%d trials]",
         final["mu_mean"],
         final["mu_hdi_lower"],
         final["mu_hdi_upper"],
         final["tau_mean"],
         final["n_trials"],
     )
+
+    # ---- Power audit (Module 4) ----------------------------------------
+    # Runs immediately after Bayesian so sequential_results are in scope.
+    # The power audit needs registration_date from the trials DataFrame and
+    # the posterior at each trial's registration date from sequential_results.
+    logging.info("Step 5b — Running power audit (Module 4)...")
+    if not trials.empty:
+        power_entries = run_power_audit(
+            trials_df          = trials,
+            sequential_results = sequential_results,
+        )
+        included = sum(1 for e in power_entries if e.excluded_reason is None)
+        biased   = sum(
+            1 for e in power_entries
+            if e.optimism_bias is not None and e.optimism_bias < -0.05
+        )
+        logging.info(
+            "  Power audit: %d included | %d excluded | %d with optimism bias > 0.05 HR units",
+            included, len(power_entries) - included, biased,
+        )
+    else:
+        logging.warning("  Power audit skipped — trials DataFrame is empty.")
+
+    return sequential_results
+
+
+def step6_scorecard(matched: pd.DataFrame, sequential_results: list[dict]) -> None:
+    """
+    Step 6 — Evidence gap scorecard (Module scorecard.py).
+
+    Clusters the matched trial pairs by endpoint type, then builds one
+    ScorecardEntry per cluster combining:
+      - Human review decisions (from decision log)
+      - Bayesian pooled HR and credible interval (from sequential analysis)
+      - Correct I² using within-trial variance σ²_i = se_log_hr² (from effect measures)
+      - Optimism bias (from power audit log)
+
+    Output: ``data/outputs/scorecard.csv``
+    """
+    if matched.empty:
+        logging.warning("Step 6 — No matched trials; scorecard not generated.")
+        return
+
+    if not DECISION_LOG_PATH.exists():
+        logging.warning("Step 6 — Decision log missing; scorecard not generated.")
+        return
+
+    logging.info("Step 6 — Building evidence gap scorecard...")
+
+    # Cluster pairs by endpoint keyword matching
+    endpoint_clusters = cluster_endpoints(matched)
+    if not endpoint_clusters:
+        logging.warning("Step 6 — No endpoint clusters produced; scorecard not generated.")
+        return
+
+    # Build within-trial variance map {pair_id: se_log_hr^2} from effect measures
+    within_trial_variances: dict[str, float] = {}
+    if EFFECT_MEASURES_PATH.exists():
+        from src.models.schemas import EffectMeasure
+        raw = json.loads(EFFECT_MEASURES_PATH.read_text(encoding="utf-8"))
+        for item in raw:
+            em = EffectMeasure(**item)
+            if em.se_log_hr and em.se_log_hr > 0:
+                within_trial_variances[em.pair_id] = round(em.se_log_hr ** 2, 8)
+
+    # Build Bayesian summaries per cluster
+    # sequential_results is ordered by trial; associate the final result with
+    # whichever cluster the last trial belongs to. For a richer mapping we
+    # use the full-dataset final posterior for every cluster that has poolable
+    # trials (conservative — per-cluster Bayesian fitting is out of scope here
+    # but architecturally supported via bayesian_summaries parameter).
+    bayesian_summaries: dict[str, dict] = {}
+    if sequential_results:
+        from src.pipeline.module3_bayesian import summarise_posterior
+        final_idata = sequential_results[-1]["idata"]
+        final_summary = summarise_posterior(final_idata)
+        # Assign the full-dataset posterior to every cluster that has poolable pairs
+        dl = pd.read_csv(DECISION_LOG_PATH, dtype=str, keep_default_na=False)
+        poolable_ids = set(dl.loc[dl["human_poolable"].str.lower() == "true", "pair_id"])
+        for cluster_name, pair_ids in endpoint_clusters.items():
+            if any(pid in poolable_ids for pid in pair_ids):
+                bayesian_summaries[cluster_name] = final_summary
+
+    # Build power audit optimism bias map {nct_id: optimism_bias}
+    power_audit_summary: dict[str, float] = {}
+    if POWER_AUDIT_LOG_PATH.exists():
+        pa = pd.read_csv(POWER_AUDIT_LOG_PATH, dtype=str, keep_default_na=False)
+        for _, row in pa.iterrows():
+            bias_raw = row.get("optimism_bias", "")
+            try:
+                power_audit_summary[row["nct_id"]] = float(bias_raw)
+            except (ValueError, TypeError):
+                pass
+
+    scorecard_entries = build_scorecard(
+        endpoint_clusters      = endpoint_clusters,
+        bayesian_summaries     = bayesian_summaries if bayesian_summaries else None,
+        power_audit_summary    = power_audit_summary if power_audit_summary else None,
+        within_trial_variances = within_trial_variances if within_trial_variances else None,
+    )
+
+    if not scorecard_entries:
+        logging.warning("Step 6 — Scorecard is empty.")
+        return
+
+    scorecard_df = pd.DataFrame([e.model_dump() for e in scorecard_entries])
+    SCORECARD_PATH.parent.mkdir(parents=True, exist_ok=True)
+    scorecard_df.to_csv(SCORECARD_PATH, index=False)
+    logging.info(
+        "  Scorecard saved: %d clusters to %s", len(scorecard_entries), SCORECARD_PATH
+    )
+    for entry in scorecard_entries:
+        logging.info(
+            "  %-30s  included=%d  switch_rate=%.0f%%  strength=%s  HR=%s",
+            entry.endpoint_cluster,
+            entry.trials_included,
+            entry.human_confirmed_switch_rate_pct,
+            entry.evidence_strength.value,
+            f"{entry.pooled_hr:.3f}" if entry.pooled_hr else "N/A",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -425,9 +549,19 @@ def main() -> None:
         return
 
     # ------------------------------------------------------------------ #
-    # Step 5 — Bayesian sequential meta-analysis                         #
+    # Step 5 — Bayesian sequential meta-analysis + power audit           #
     # ------------------------------------------------------------------ #
-    step5_bayesian(skip=False)
+    sequential_results = step5_bayesian(skip=False, trials=trials)
+
+    # ------------------------------------------------------------------ #
+    # Step 6 — Evidence gap scorecard                                    #
+    # ------------------------------------------------------------------ #
+    matched = (
+        pd.read_csv(MATCHED_TRIALS_PATH, dtype=str, keep_default_na=False)
+        if MATCHED_TRIALS_PATH.exists()
+        else pd.DataFrame()
+    )
+    step6_scorecard(matched=matched, sequential_results=sequential_results)
 
     logging.info("Pipeline run complete.")
 

@@ -66,6 +66,130 @@ def compute_ai_calibration(
 
 
 # ---------------------------------------------------------------------------
+# Endpoint clustering
+# ---------------------------------------------------------------------------
+
+# Ordered list of (cluster_name, [keyword_patterns]).
+# A pair is assigned to the FIRST matching cluster; unmatched pairs fall into
+# "other_endpoints".  Patterns are matched case-insensitively against the
+# registered endpoint text.
+_CLUSTER_RULES: list[tuple[str, list[str]]] = [
+    ("mace_composite", [
+        "composite", "mace", "major adverse cardiovascular",
+        "cardiovascular death.*hospitali", "hospitali.*cardiovascular death",
+        "death.*heart failure", "heart failure.*death",
+        "worsening heart failure.*death", "death.*worsening heart failure",
+    ]),
+    ("all_cause_mortality", [
+        "all.cause mort", "all.cause death", "all cause mort", "all cause death",
+        "death from any cause", "death due to any cause",
+    ]),
+    ("cv_mortality", [
+        "cardiovascular death", "cardiovascular mort", "cv death", "cv mort",
+        "cardiac death", "cardiac mort",
+    ]),
+    ("hf_hospitalization", [
+        "heart failure hospitali", "hf hospitali", "hospitali.*heart failure",
+        "worsening heart failure", "acute decompensated", "urgent visit.*heart failure",
+        "heart failure.*urgent visit",
+    ]),
+    ("exercise_capacity", [
+        "6.minute walk", "six.minute walk", "6mwt", "peak vo2", "vo2 max",
+        "exercise capacity", "exercise tolerance", "cardiopulmonary exercise",
+    ]),
+    ("nt_probnp_biomarkers", [
+        "nt.probnp", "nt probnp", r"\bbnp\b", "natriuretic peptide",
+        "troponin", "galectin", "st2",
+    ]),
+    ("quality_of_life", [
+        "kccq", "quality of life", "qol", "mlhfq", "minnesota living",
+        "patient.reported", "symptom", "kansas city",
+    ]),
+    ("lvef_remodeling", [
+        "ejection fraction", "lvef", "left ventricular ejection",
+        "end.diastolic volume", "end.systolic volume", "lv remodel",
+        "reverse remodel",
+    ]),
+]
+
+
+def cluster_endpoints(
+    matched_df: pd.DataFrame,
+    registered_col: str = "registered_endpoint",
+    pair_id_col: str = "pair_id",
+) -> dict[str, list[str]]:
+    """
+    Assign each trial pair to an endpoint cluster based on keyword matching
+    against its registered endpoint text.
+
+    Parameters
+    ----------
+    matched_df :
+        DataFrame that must contain ``pair_id`` and ``registered_endpoint``
+        columns.  Typically the output of ``run_endpoint_matching()``.
+    registered_col :
+        Column name containing the pre-specified registered endpoint text.
+    pair_id_col :
+        Column name containing the unique pair identifier.
+
+    Returns
+    -------
+    dict[str, list[str]]
+        Mapping of ``cluster_name`` to the list of ``pair_id`` values assigned
+        to that cluster.  Every pair_id appears in exactly one cluster.
+        Unmatched pairs land in ``"other_endpoints"``.
+
+    Notes
+    -----
+    - Matching is case-insensitive and uses Python ``re.search``.
+    - The first matching cluster wins (rules are ordered from most specific
+      to most general).
+    - Pairs with a blank or missing registered endpoint go to
+      ``"missing_endpoint"`` so they are explicitly visible in the scorecard
+      rather than silently ignored.
+    """
+    import re as _re
+
+    clusters: dict[str, list[str]] = {name: [] for name, _ in _CLUSTER_RULES}
+    clusters["other_endpoints"] = []
+    clusters["missing_endpoint"] = []
+
+    for _, row in matched_df.iterrows():
+        pair_id = str(row.get(pair_id_col, "")).strip()
+        text    = str(row.get(registered_col, "")).strip().lower()
+
+        if not text or text in {"", "none", "nan"}:
+            clusters["missing_endpoint"].append(pair_id)
+            continue
+
+        assigned = False
+        for cluster_name, patterns in _CLUSTER_RULES:
+            for pattern in patterns:
+                if _re.search(pattern, text, _re.IGNORECASE):
+                    clusters[cluster_name].append(pair_id)
+                    assigned = True
+                    break
+            if assigned:
+                break
+
+        if not assigned:
+            clusters["other_endpoints"].append(pair_id)
+
+    # Drop empty clusters to keep the scorecard tidy
+    clusters = {k: v for k, v in clusters.items() if v}
+
+    logger.info(
+        "Endpoint clustering complete: %d clusters, %d pairs total.",
+        len(clusters),
+        sum(len(v) for v in clusters.values()),
+    )
+    for name, ids in sorted(clusters.items()):
+        logger.info("  %-30s %d pair(s)", name, len(ids))
+
+    return clusters
+
+
+# ---------------------------------------------------------------------------
 # Per-cluster scorecard construction
 # ---------------------------------------------------------------------------
 
@@ -76,6 +200,7 @@ def build_scorecard(
     bayesian_summaries: Optional[dict[str, dict]] = None,
     power_audit_summary: Optional[dict[str, float]] = None,
     gold_standard_path: Optional[str] = None,
+    within_trial_variances: Optional[dict[str, float]] = None,
 ) -> list[ScorecardEntry]:
     """
     Build one ScorecardEntry per endpoint cluster.
@@ -86,6 +211,10 @@ def build_scorecard(
     bayesian_summaries : {cluster_name: summarise_posterior() output}
     power_audit_summary : {nct_id: optimism_bias}
     gold_standard_path : optional path to gold_standard.csv for AI calibration
+    within_trial_variances : {pair_id: se_log_hr ** 2}
+        Within-trial variances (σ²_i) derived from the effect measures.
+        Used for the correct I² = τ² / (τ² + σ²_typical) formula.
+        If None, I² is not computed.
     """
     dl = pd.read_csv(decision_log_path, dtype=str, keep_default_na=False)
     ll = pd.read_csv(linkage_log_path, dtype=str, keep_default_na=False)
@@ -142,13 +271,23 @@ def build_scorecard(
         cri_upper = bayes.get("pooled_hr_cri_upper")
         tau = bayes.get("tau_mean")
 
-        # I² approximation
+        # I² = τ² / (τ² + σ²_typical) × 100
+        # σ²_typical is the median within-trial variance (se_log_hr²) for
+        # trials in this cluster.  SSI is a UI routing metric — it must NOT
+        # be used here.  If variances are unavailable the field is left None.
         i_squared: Optional[float] = None
-        if tau is not None:
-            median_var = float(
-                pd.to_numeric(cluster_dl["ssi"], errors="coerce").median() or 1.0
-            )
-            i_squared = round(tau**2 / (tau**2 + median_var) * 100, 1)
+        if tau is not None and within_trial_variances:
+            cluster_vars = [
+                within_trial_variances[pid]
+                for pid in pair_ids
+                if pid in within_trial_variances
+            ]
+            if cluster_vars:
+                sigma2_typical = float(np.median(cluster_vars))
+                if sigma2_typical > 0:
+                    i_squared = round(
+                        tau ** 2 / (tau ** 2 + sigma2_typical) * 100, 1
+                    )
 
         # Mean optimism bias from power audit
         if power_audit_summary:

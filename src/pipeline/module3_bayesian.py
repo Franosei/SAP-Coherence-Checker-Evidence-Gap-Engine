@@ -179,13 +179,17 @@ def run_sequential_analysis(
 
         results.append(
             {
-                "n_trials": i,
-                "nct_id": subset.iloc[-1]["nct_id"],
-                "mu_mean": float(np.exp(posterior_mu.mean())),   # back-transform to HR scale
-                "mu_hdi_lower": float(np.exp(hdi[0])),
-                "mu_hdi_upper": float(np.exp(hdi[1])),
-                "tau_mean": tau_mean,
-                "idata": idata,
+                "n_trials":          i,
+                "nct_id":            subset.iloc[-1]["nct_id"],
+                # registration_date of the last-added trial — required by
+                # module4_power_audit.get_posterior_hr_at_date() so that the
+                # optimism bias can be computed for each trial.
+                "registration_date": str(subset.iloc[-1].get("registration_date", "")),
+                "mu_mean":           float(np.exp(posterior_mu.mean())),  # HR scale
+                "mu_hdi_lower":      float(np.exp(hdi[0])),
+                "mu_hdi_upper":      float(np.exp(hdi[1])),
+                "tau_mean":          tau_mean,
+                "idata":             idata,
             }
         )
 
