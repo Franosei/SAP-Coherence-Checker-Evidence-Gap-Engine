@@ -1,8 +1,8 @@
 """
-SAP Coherence Checker - Audit Dashboard (v2.0).
+SAP Coherence Checker - Audit Dashboard (v3.0).
 
 Run:
-    python -m shiny run --reload --port 8080 src/dashboard/app.py
+    python -m shiny run --port 8030 src/dashboard/app.py
 """
 
 from __future__ import annotations
@@ -186,7 +186,7 @@ def brand_title() -> ui.Tag:
         ui.div("SC", class_="brand-icon"),
         ui.div(
             ui.div("SAP Coherence Checker", class_="brand-title"),
-            ui.div("v2.0", class_="brand-version"),
+            ui.div("v3.0", class_="brand-version"),
             class_="brand-copy",
         ),
         class_="brand-wrap",
@@ -1000,7 +1000,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         no_pub_ep  = len(frame[frame["published_endpoint"].eq("")])
 
         lines = [
-            f"The pipeline linked {len(frame)} HFrEF trial-publication pairs using the PubMed linkage cascade.",
+            f"The pipeline linked {len(frame)} breast cancer trial-publication pairs using the PubMed linkage cascade.",
             f"{auto_conc} pairs were routed as concordant.",
             f"{auto_major} pairs were routed as major switch.",
             f"{len(frame[frame['routing']=='llm'])} pairs were sent to the model for adjudication.",

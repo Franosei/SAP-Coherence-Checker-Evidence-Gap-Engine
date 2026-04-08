@@ -126,7 +126,7 @@ def get_posterior_hr_at_date(
 def run_power_audit(
     trials_df: pd.DataFrame,
     sequential_results: list[dict],
-    assumed_event_rate: float = 0.15,  # default for HFrEF MACE endpoints
+    assumed_event_rate: float = 0.15,  # default fallback for time-to-event oncology endpoints
     alpha: float = 0.05,
     power: float = 0.80,
     inputs_source: str = "registry",

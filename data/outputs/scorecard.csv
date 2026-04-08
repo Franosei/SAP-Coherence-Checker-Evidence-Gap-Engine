@@ -1,0 +1,2 @@
+endpoint_cluster,trials_included,trials_excluded,trials_unlinked,human_override_rate_pct,mean_ssi,human_confirmed_switch_rate_pct,ai_human_agreement_rate_pct,pooled_hr,pooled_hr_cri_lower,pooled_hr_cri_upper,between_trial_tau,i_squared_pct,mean_optimism_bias,evidence_strength
+missing_endpoint,0,0,0,0.0,51.02,0.0,55.6,,,,,,,Gap

@@ -28,7 +28,7 @@ import json
 import logging
 import os
 import re
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -58,10 +58,16 @@ logger = logging.getLogger(__name__)
 
 
 _LLM_SYSTEM_PROMPT = """\
-You are a clinical biostatistician expert in randomised controlled trial design \
-and endpoint reporting. Your task is to classify whether the primary endpoint \
-registered in ClinicalTrials.gov matches the primary endpoint reported in the \
-published paper.
+You are a clinical biostatistician with specialist expertise in breast cancer \
+randomised controlled trial design and endpoint reporting. Your task is to \
+classify whether the primary endpoint registered in ClinicalTrials.gov matches \
+the primary endpoint reported in the published paper.
+
+Context: This pipeline processes breast cancer trials across three subtypes \
+(HER2-positive, HR+/HER2-negative, TNBC) and three treatment settings \
+(neoadjuvant, adjuvant, metastatic). Use the provided subtype and setting to \
+inform your clinical reasoning — for example, a switch from pCR to EFS in a \
+neoadjuvant trial constitutes a surrogate substitution, not a minor modification.
 
 Reason step by step before giving your final classification. \
 Return ONLY a valid JSON object matching the schema below — no surrounding text, \
@@ -71,7 +77,7 @@ Schema:
 {
   "switch_type": "concordant" | "minor_modification" | "moderate_switch" | "major_switch",
   "direction":   "none" | "promotion_of_secondary" | "composite_modified" |
-                 "timeframe_changed" | "endpoint_replaced",
+                 "timeframe_changed" | "endpoint_replaced" | "surrogate_substituted",
   "step_by_step_reasoning": "<mandatory — minimum 2-3 sentences of clinical reasoning>",
   "confidence":             "high" | "medium" | "low",
   "comparability_for_pooling": true | false,
@@ -81,6 +87,8 @@ Schema:
 
 Rules:
 - step_by_step_reasoning is mandatory. Never omit it.
+- Use direction="surrogate_substituted" when a surrogate endpoint (e.g. pCR) was \
+  registered but a long-term survival endpoint (EFS, DFS, OS) was reported, or vice versa.
 - Set flag_for_human_review=true whenever you are uncertain about any aspect.
 - Set confidence="low" when endpoint text is ambiguous or composite components are unclear.
 - comparability_for_pooling answers: are these two endpoints clinically equivalent enough to \
@@ -88,6 +96,9 @@ Rules:
 """
 
 _LLM_USER_TEMPLATE = """\
+Trial subtype: {bc_subtype}
+Treatment setting: {bc_setting}
+
 Registered endpoint (ClinicalTrials.gov):
 {registered}
 
@@ -123,7 +134,7 @@ def _cosine(vec_a: list[float], vec_b: list[float]) -> float:
     return max(0.0, min(1.0, dot))
 
 
-def _embed_batch(texts: list[str], client: "openai.OpenAI") -> list[list[float]]:
+def _embed_batch(texts: list[str], client: Any) -> list[list[float]]:
     """
     Embed a batch of texts via the OpenAI Embeddings API.
 
@@ -285,9 +296,21 @@ class _LLMCostTracker:
 _cost_tracker = _LLMCostTracker()
 
 
-def _call_llm(registered: str, published: str) -> Optional[LLMEndpointClassification]:
+def _call_llm(
+    registered: str,
+    published: str,
+    bc_subtype: str = "unknown_subtype",
+    bc_setting: str = "unknown_setting",
+) -> Optional[LLMEndpointClassification]:
     """
     Submit one ambiguous endpoint pair to the configured OpenAI-compatible model.
+
+    Parameters
+    ----------
+    registered : registered primary endpoint text from CT.gov
+    published : published primary endpoint text from PubMed
+    bc_subtype : breast cancer subtype label from the population classifier
+    bc_setting : treatment setting label from the population classifier
     """
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -308,6 +331,8 @@ def _call_llm(registered: str, published: str) -> Optional[LLMEndpointClassifica
     user_content = _LLM_USER_TEMPLATE.format(
         registered=_normalise(registered),
         published=_normalise(published),
+        bc_subtype=bc_subtype or "unknown_subtype",
+        bc_setting=bc_setting or "unknown_setting",
     )
 
     try:
@@ -410,6 +435,9 @@ def run_endpoint_matching(linked_df: pd.DataFrame) -> pd.DataFrame:
         routing = _route_from_score(score)
         routings.append(routing.value)
 
+        bc_subtype_val = str(row.get("bc_subtype", "unknown_subtype") or "unknown_subtype")
+        bc_setting_val = str(row.get("bc_setting", "unknown_setting") or "unknown_setting")
+
         entry = DecisionLogEntry.from_layer1(
             pair_id=pair_id,
             registered_endpoint=registered,
@@ -417,10 +445,12 @@ def run_endpoint_matching(linked_df: pd.DataFrame) -> pd.DataFrame:
             similarity_score=score,
             routing=routing,
         )
+        entry.bc_subtype = bc_subtype_val
+        entry.bc_setting = bc_setting_val
 
         if routing == EndpointRouting.LLM:
             logger.debug("Layer 2 - LLM adjudication for %s (score=%.4f)", pair_id, score)
-            llm_result = _call_llm(registered, published)
+            llm_result = _call_llm(registered, published, bc_subtype_val, bc_setting_val)
             entry.llm_model = LLM_MODEL_PRIMARY
 
             if llm_result is not None:

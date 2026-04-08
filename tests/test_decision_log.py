@@ -21,8 +21,8 @@ from src.models.schemas import (
 def _make_entry(pair_id: str, score: float, routing: EndpointRouting) -> DecisionLogEntry:
     return DecisionLogEntry.from_layer1(
         pair_id=pair_id,
-        registered_endpoint="Primary composite endpoint of CV death or HF hospitalisation",
-        published_endpoint="Composite of CV death or hospitalisation for heart failure",
+        registered_endpoint="Pathologic complete response in breast and axilla at surgery",
+        published_endpoint="Pathologic complete response at definitive surgery",
         similarity_score=score,
         routing=routing,
     )

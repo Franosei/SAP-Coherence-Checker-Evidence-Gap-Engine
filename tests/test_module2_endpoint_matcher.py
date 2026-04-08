@@ -44,7 +44,11 @@ def test_run_endpoint_matching_uses_published_endpoint_and_linkage_gate(monkeypa
         flag_for_human_review=False,
         key_differences=["follow-up window changed"],
     )
-    monkeypatch.setattr(matcher, "_call_llm", lambda registered, published: llm_result)
+    monkeypatch.setattr(
+        matcher,
+        "_call_llm",
+        lambda registered, published, bc_subtype="unknown_subtype", bc_setting="unknown_setting": llm_result,
+    )
 
     linked = pd.DataFrame(
         [

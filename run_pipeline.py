@@ -8,7 +8,7 @@ or re-spending LLM API credits.
 Pipeline flow
 -------------
 Step 1 — ClinicalTrials.gov fetch  (Module 1, Step A)
-    Query CT.gov for all HFrEF Phase 2/3 RCTs with posted results.
+    Query CT.gov for all breast cancer Phase 2/3 RCTs with posted results.
     Output: ``data/outputs/trials.csv``
 
 Step 2 — NCT-to-PMID linkage  (Module 1, Step B)
@@ -61,7 +61,7 @@ from src.pipeline.config import (
     POWER_AUDIT_LOG_PATH,
 )
 from src.pipeline.hr_extractor import extract_effect_measures
-from src.pipeline.module1_linker import fetch_hfref_trials, link_to_pubmed
+from src.pipeline.module1_linker import fetch_breast_cancer_trials, link_to_pubmed
 from src.pipeline.module2_endpoint_matcher import run_endpoint_matching
 from src.pipeline.module4_power_audit import run_power_audit
 from src.pipeline.scorecard import build_scorecard, cluster_endpoints
@@ -167,7 +167,7 @@ def _already_matched() -> set[str]:
 
 def step1_fetch_trials(max_records: int | None, fresh_run: bool) -> pd.DataFrame:
     """
-    Step 1 — Fetch HFrEF trials from ClinicalTrials.gov.
+    Step 1 — Fetch breast cancer trials from ClinicalTrials.gov.
 
     Reuses ``trials.csv`` if it exists and ``--fresh-run`` is not set,
     allowing the pipeline to resume without an additional CT.gov query.
@@ -179,7 +179,7 @@ def step1_fetch_trials(max_records: int | None, fresh_run: bool) -> pd.DataFrame
         return trials
 
     logging.info("Step 1 — Fetching trials from ClinicalTrials.gov...")
-    trials = fetch_hfref_trials(max_records=max_records)
+    trials = fetch_breast_cancer_trials(max_records=max_records)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     trials.to_csv(TRIALS_PATH, index=False)
     logging.info("  Saved %d trials to %s", len(trials), TRIALS_PATH)

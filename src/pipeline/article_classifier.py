@@ -374,7 +374,7 @@ def _heuristic_classify(record: PubMedRecord) -> ArticleClassification:
             reason       = (
                 f"Publication type(s) confirm results paper: "
                 f"{', '.join(sorted(accept_types))}."
-                + (f" Results section present." if result_sections else "")
+                + (" Results section present." if result_sections else "")
             ),
             flag_for_review = False,
             signals      = signals,

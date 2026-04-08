@@ -129,8 +129,8 @@ def jaccard_token_similarity(text_a: str, text_b: str) -> float:
     Examples
     --------
     >>> jaccard_token_similarity(
-    ...     "PARADIGM-HF: LCZ696 versus Enalapril in HFrEF",
-    ...     "Angiotensin receptor neprilysin inhibition versus enalapril HFrEF",
+    ...     "KATHERINE: Trastuzumab Emtansine versus Trastuzumab in HER2-positive breast cancer",
+    ...     "Adjuvant trastuzumab emtansine for residual invasive HER2-positive breast cancer",
     ... )
     0.2857...
     """
@@ -177,7 +177,7 @@ class PubMedClient:
         self._rate_limit_s = rate_limit_s
         self._last_call_ts: float = 0.0
         self._session      = requests.Session()
-        self._session.headers.update({"User-Agent": "SAP-Coherence-Checker/2.0 (research)"})
+        self._session.headers.update({"User-Agent": "SAP-Coherence-Checker/3.0 (research)"})
 
     # ------------------------------------------------------------------
     # Public search methods

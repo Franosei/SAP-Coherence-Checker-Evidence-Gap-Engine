@@ -73,42 +73,81 @@ def compute_ai_calibration(
 # A pair is assigned to the FIRST matching cluster; unmatched pairs fall into
 # "other_endpoints".  Patterns are matched case-insensitively against the
 # registered endpoint text.
+#
+# Breast cancer endpoint taxonomy (Section 3.2 of the v3.0 proposal):
+#   1. pathological_complete_response — pCR endpoints (neoadjuvant)
+#   2. event_free_disease_free_survival — EFS/DFS/iDFS (adjuvant)
+#   3. overall_survival — OS / all-cause death
+#   4. progression_free_survival — PFS/TTP/PFS2 (metastatic)
+#   5. objective_response_rate — ORR/CBR/CR+PR
+#   6. patient_reported_outcomes — QoL/PRO/symptom burden
 _CLUSTER_RULES: list[tuple[str, list[str]]] = [
-    ("mace_composite", [
-        "composite", "mace", "major adverse cardiovascular",
-        "cardiovascular death.*hospitali", "hospitali.*cardiovascular death",
-        "death.*heart failure", "heart failure.*death",
-        "worsening heart failure.*death", "death.*worsening heart failure",
+    ("pathological_complete_response", [
+        r"pathologic(?:al)?\s+complete\s+response",
+        r"\bpcr\b",
+        r"ypt0",
+        r"ypn0",
+        r"residual\s+cancer\s+burden",
+        r"\brcb\b",
+        r"ypT0/is",
+        r"no\s+residual\s+invasive\s+disease",
+        r"complete\s+pathologic\s+response",
     ]),
-    ("all_cause_mortality", [
-        "all.cause mort", "all.cause death", "all cause mort", "all cause death",
-        "death from any cause", "death due to any cause",
+    ("event_free_disease_free_survival", [
+        r"\befs\b",
+        r"event[- ]free\s+survival",
+        r"\bdfs\b",
+        r"disease[- ]free\s+survival",
+        r"\bidfs\b",
+        r"invasive\s+disease[- ]free\s+survival",
+        r"\birfs\b",
+        r"\brfs\b",
+        r"relapse[- ]free\s+survival",
+        r"recurrence[- ]free\s+survival",
+        r"distant\s+disease[- ]free\s+survival",
     ]),
-    ("cv_mortality", [
-        "cardiovascular death", "cardiovascular mort", "cv death", "cv mort",
-        "cardiac death", "cardiac mort",
+    ("overall_survival", [
+        r"\bos\b",
+        r"overall\s+survival",
+        r"all[- ]cause\s+mort",
+        r"all[- ]cause\s+death",
+        r"death\s+from\s+any\s+cause",
+        r"death\s+due\s+to\s+any\s+cause",
+        r"survival\s+time",
     ]),
-    ("hf_hospitalization", [
-        "heart failure hospitali", "hf hospitali", "hospitali.*heart failure",
-        "worsening heart failure", "acute decompensated", "urgent visit.*heart failure",
-        "heart failure.*urgent visit",
+    ("progression_free_survival", [
+        r"\bpfs\b",
+        r"progression[- ]free\s+survival",
+        r"\bttp\b",
+        r"time\s+to\s+progression",
+        r"\bpfs2\b",
+        r"second\s+progression[- ]free\s+survival",
+        r"time\s+to\s+disease\s+progression",
+        r"time\s+to\s+treatment\s+failure",
     ]),
-    ("exercise_capacity", [
-        "6.minute walk", "six.minute walk", "6mwt", "peak vo2", "vo2 max",
-        "exercise capacity", "exercise tolerance", "cardiopulmonary exercise",
+    ("objective_response_rate", [
+        r"\borr\b",
+        r"objective\s+response\s+rate",
+        r"\bcbr\b",
+        r"clinical\s+benefit\s+rate",
+        r"complete\s+response.*partial\s+response",
+        r"cr\s*\+\s*pr",
+        r"overall\s+response\s+rate",
+        r"confirmed\s+response",
+        r"best\s+overall\s+response",
     ]),
-    ("nt_probnp_biomarkers", [
-        "nt.probnp", "nt probnp", r"\bbnp\b", "natriuretic peptide",
-        "troponin", "galectin", "st2",
-    ]),
-    ("quality_of_life", [
-        "kccq", "quality of life", "qol", "mlhfq", "minnesota living",
-        "patient.reported", "symptom", "kansas city",
-    ]),
-    ("lvef_remodeling", [
-        "ejection fraction", "lvef", "left ventricular ejection",
-        "end.diastolic volume", "end.systolic volume", "lv remodel",
-        "reverse remodel",
+    ("patient_reported_outcomes", [
+        r"quality\s+of\s+life",
+        r"\bqol\b",
+        r"\bpro\b",
+        r"patient[- ]reported",
+        r"symptom\s+burden",
+        r"\beortc\b",
+        r"qlq[- ]",
+        r"\bfact[- ]",
+        r"functional\s+assessment",
+        r"pain\s+score",
+        r"fatigue\s+scale",
     ]),
 ]
 

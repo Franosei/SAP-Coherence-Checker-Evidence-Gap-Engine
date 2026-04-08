@@ -50,6 +50,7 @@ class SwitchDirection(str, Enum):
     COMPOSITE_MODIFIED = "composite_modified"
     TIMEFRAME_CHANGED = "timeframe_changed"
     ENDPOINT_REPLACED = "endpoint_replaced"
+    SURROGATE_SUBSTITUTED = "surrogate_substituted"  # pCR-to-survival substitution
 
 
 class LLMConfidence(str, Enum):
@@ -89,8 +90,8 @@ class LinkageAuditEntry(BaseModel):
     linkage_confidence: LinkageConfidence
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     linked_by: str = Field(
-        default="pipeline_v2.0",
-        description="'pipeline_v2.0' or 'reviewer:<initials>' if manually resolved",
+        default="pipeline_v3.0",
+        description="'pipeline_v3.0' or 'reviewer:<initials>' if manually resolved",
     )
     notes: Optional[str] = Field(None, description="Free text — e.g. resolution rationale")
 
@@ -151,6 +152,16 @@ class DecisionLogEntry(BaseModel):
     llm_confidence: Optional[LLMConfidence] = None
     llm_comparability: Optional[bool] = None
     llm_flag: Optional[bool] = None
+
+    # Breast cancer population context (populated by Module 1 classifier)
+    bc_subtype: Optional[str] = Field(
+        None,
+        description="her2_positive | hr_positive | tnbc | unknown_subtype",
+    )
+    bc_setting: Optional[str] = Field(
+        None,
+        description="neoadjuvant | adjuvant | metastatic | unknown_setting",
+    )
 
     # Layer 3 — Human review
     human_reviewed: HumanReviewStatus = HumanReviewStatus.NO

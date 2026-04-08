@@ -5,10 +5,10 @@ This module is responsible for two sequential steps that together produce
 the input dataset for all downstream modules:
 
 Step A — ClinicalTrials.gov fetch
-    Query the CT.gov REST API v2 for all HFrEF Phase 2/3 interventional RCTs
-    with posted results.  For each trial, extract the registered (pre-specified)
-    primary endpoints from the *protocol* section.  These are the endpoints the
-    study was powered for before any data were collected.
+    Query the CT.gov REST API v2 for all breast cancer Phase 2/3 interventional
+    RCTs with posted results.  For each trial, extract the registered
+    (pre-specified) primary endpoints from the *protocol* section.  These are
+    the endpoints the study was powered for before any data were collected.
 
 Step B — NCT-to-PMID linkage cascade  (Section 3.2.2)
     Link each registered trial to its peer-reviewed journal publication using a
@@ -75,13 +75,13 @@ import requests
 
 from src.models.linkage_log import LinkageLog
 from src.models.schemas import LinkageAuditEntry, LinkageConfidence, LinkageMethod
+from src.pipeline.article_classifier import ArticleVerdict, classify_article
 from src.pipeline.config import (
     CT_BASE_URL,
     CT_COMPLETION_END,
     CT_COMPLETION_START,
     CT_CONDITIONS,
     CT_EXCLUDE_POPULATION_CLASSES,
-    CT_HFREF_LVEF_CEILING,
     CT_PAGE_SIZE,
     CT_PHASES,
     CT_REQUEST_TIMEOUT_S,
@@ -91,81 +91,123 @@ from src.pipeline.config import (
     LINKAGE_JACCARD_HIGH,
     LINKAGE_JACCARD_MEDIUM,
 )
-from src.pipeline.article_classifier import ArticleVerdict, classify_article
 from src.pipeline.pubmed_client import PubMedClient, PubMedRecord, jaccard_token_similarity
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# HFrEF population classifier
+# Breast cancer population classifier  (2-D: subtype × treatment setting)
 # ---------------------------------------------------------------------------
-# The CT.gov API offers no LVEF-based filter.  A broad condition query is
-# therefore used at the API level (to avoid missing trials registered as plain
-# "Heart Failure") and a post-fetch classifier enforces the HFrEF boundary by
-# reading each trial's eligibility criteria text, title, and conditions list.
+# The CT.gov API has no breast-cancer subtype filter.  A broad condition query
+# is used at the API level and this post-fetch classifier assigns each trial a
+# two-dimensional label read from its eligibility criteria, title, and
+# conditions list.
 #
-# Classification outcomes
-# -----------------------
-# hfref_confirmed  — LVEF threshold ≤ CT_HFREF_LVEF_CEILING % confirmed in
-#                    eligibility criteria, or explicit HFrEF keyword in title.
-#                    Included in all downstream analysis.
+# Dimension 1 — Tumour subtype  (bc_subtype column)
+# --------------------------------------------------
+# her2_positive    — HER2+ / HER2-amplified / HER2-overexpressing
+# hr_positive      — HR+/HER2- (ER+ and/or PR+, HER2-negative)
+# tnbc             — Triple-negative (ER-, PR-, HER2-)
+# unknown_subtype  — Subtype not determinable; trial kept, flagged for review
 #
-# hfpef_excluded   — Preserved-EF keyword found and no reduced-EF signal.
-#                    Removed before linkage; written to the exclusion log.
+# Dimension 2 — Treatment setting  (bc_setting column)
+# -----------------------------------------------------
+# neoadjuvant      — Pre-surgical (primary) treatment
+# adjuvant         — Post-surgical treatment
+# metastatic       — Advanced / metastatic / recurrent disease
+# unknown_setting  — Setting not determinable; trial kept, flagged for review
 #
-# mixed_flag       — HFmrEF/borderline keyword, or conflicting signals.
-#                    Kept in dataset but flagged for human review.
-#
-# ambiguous        — No explicit EF criterion found in the available text.
-#                    Kept in dataset, flagged; human reviewer decides.
+# Trials not about breast cancer at all → "non_breast_excluded" (removed).
 
-# Patterns are compiled once at module load — reused for every trial row.
+# Patterns compiled once at import — reused for every trial row.
 
-_RE_HFREF_KEYWORD = re.compile(
+_RE_BC_HER2_POS = re.compile(
     r"\b("
-    r"hfref"
-    r"|heart\s+failure\s+with\s+reduced\s+ejection\s+fraction"
-    r"|systolic\s+heart\s+failure"
-    r"|systolic\s+dysfunction"
-    r"|reduced\s+ejection\s+fraction"
-    r"|reduced\s+ef"
-    r"|left\s+ventricular\s+systolic\s+dysfunction"
+    r"her2[- ]positive"
+    r"|her2[- ]amplified"
+    r"|her2[- ]overexpressing"
+    r"|her2[+]"
+    r"|erbb2[- ]positive"
+    r"|erbb2[- ]amplified"
+    r"|trastuzumab.{0,40}eligible"          # surrogate signal
     r")\b",
     re.IGNORECASE,
 )
 
-_RE_HFPEF_KEYWORD = re.compile(
+_RE_BC_HER2_NEG = re.compile(
     r"\b("
-    r"hfpef"
-    r"|heart\s+failure\s+with\s+preserved\s+ejection\s+fraction"
-    r"|preserved\s+ejection\s+fraction"
-    r"|preserved\s+ef"
-    r"|diastolic\s+heart\s+failure"
+    r"her2[- ]negative"
+    r"|her2[- ]low"
+    r"|her2\s*[-]\s*(er|pr)\s*positive"    # common shorthand
     r")\b",
     re.IGNORECASE,
 )
 
-_RE_HFMREF_KEYWORD = re.compile(
+_RE_BC_TNBC = re.compile(
     r"\b("
-    r"hfmref"
-    r"|mildly\s+reduced\s+ejection\s+fraction"
-    r"|mid[- ]range\s+ejection\s+fraction"
-    r"|borderline\s+ejection\s+fraction"
+    r"triple[- ]negative"
+    r"|tnbc"
+    r"|er[- ]negative.*pr[- ]negative.*her2[- ]negative"
+    r"|er\s*negative\s*and\s*pr\s*negative"  # sometimes HER2 implied
     r")\b",
     re.IGNORECASE,
 )
 
-# Matches "LVEF < 40 %", "ejection fraction ≤ 35%", "EF <45%", etc.
-# The threshold value is captured in group 1 so it can be logged.
-_RE_LVEF_LOW = re.compile(
-    r"(?:lvef|ejection\s+fraction|ef)\s*[<≤]\s*=?\s*(\d{2})\s*%",
+_RE_BC_HR_POS = re.compile(
+    r"\b("
+    r"hormone\s+receptor[- ]positive"
+    r"|hr[+]"
+    r"|hr[- ]positive"
+    r"|estrogen\s+receptor[- ]positive"
+    r"|er[+]"
+    r"|er[- ]positive"
+    r"|progesterone\s+receptor[- ]positive"
+    r"|pr[+]"
+    r"|pr[- ]positive"
+    r"|luminal"                              # luminal A/B subtypes
+    r")\b",
     re.IGNORECASE,
 )
 
-# Matches "LVEF > 50 %", "EF ≥ 45%", "ejection fraction > 40%" (HFpEF gate)
-_RE_LVEF_HIGH = re.compile(
-    r"(?:lvef|ejection\s+fraction|ef)\s*[>≥]\s*=?\s*(\d{2})\s*%",
+_RE_BC_NEOADJUVANT = re.compile(
+    r"\b("
+    r"neoadjuvant"
+    r"|pre[- ]surgical"
+    r"|pre[- ]operative"
+    r"|primary\s+(systemic\s+)?therapy"
+    r"|primary\s+treatment"
+    r"|preoperative\s+chemotherapy"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_RE_BC_ADJUVANT = re.compile(
+    r"\b("
+    r"adjuvant"
+    r"|post[- ]surgical"
+    r"|post[- ]operative"
+    r"|after\s+(surgery|resection|mastectomy|lumpectomy)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_RE_BC_METASTATIC = re.compile(
+    r"\b("
+    r"metastatic"
+    r"|advanced"
+    r"|unresectable"
+    r"|locally\s+advanced"
+    r"|recurrent"
+    r"|stage\s+iv"
+    r"|stage\s+4"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Guard against non-breast oncology trials slipping through the broad query.
+_RE_BC_BREAST = re.compile(
+    r"\b(breast)\b",
     re.IGNORECASE,
 )
 
@@ -174,14 +216,9 @@ def _classify_population(
     title: str,
     conditions: list[str],
     eligibility_criteria: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """
-    Classify a trial's enrolled population as HFrEF, HFpEF, mixed, or ambiguous.
-
-    The classifier checks three sources in descending specificity:
-      1. Eligibility criteria text (most reliable — contains numeric LVEF thresholds)
-      2. Trial title (often explicit: "…in HFrEF", "…Systolic Heart Failure")
-      3. Conditions list (varies widely; used only to confirm, not to exclude)
+    Classify a trial's population along two breast cancer dimensions.
 
     Parameters
     ----------
@@ -194,73 +231,73 @@ def _classify_population(
 
     Returns
     -------
-    tuple[str, str]
-        ``(population_class, population_notes)`` where ``population_class`` is
-        one of: ``hfref_confirmed``, ``hfpef_excluded``, ``mixed_flag``,
-        ``ambiguous``.
+    tuple[str, str, str]
+        ``(population_class, bc_subtype, bc_setting)`` where:
+        - ``population_class`` is ``"bc_confirmed"`` (included),
+          ``"non_breast_excluded"`` (removed), or ``"bc_flagged"`` (kept,
+          flagged for human review when subtype or setting is unknown).
+        - ``bc_subtype`` is one of: ``her2_positive``, ``hr_positive``,
+          ``tnbc``, ``unknown_subtype``.
+        - ``bc_setting`` is one of: ``neoadjuvant``, ``adjuvant``,
+          ``metastatic``, ``unknown_setting``.
     """
-    combined     = " ".join([title] + conditions)
-    criteria_lc  = eligibility_criteria  # keep original case for regex
+    combined  = " ".join([title] + conditions + [eligibility_criteria])
 
-    # ---- Signal detection ------------------------------------------------
-    hfref_kw    = bool(_RE_HFREF_KEYWORD.search(combined + " " + criteria_lc))
-    hfpef_kw    = bool(_RE_HFPEF_KEYWORD.search(combined + " " + criteria_lc))
-    hfmref_kw   = bool(_RE_HFMREF_KEYWORD.search(combined + " " + criteria_lc))
+    # ---- Guard: is this actually a breast cancer trial? ------------------
+    if not _RE_BC_BREAST.search(combined):
+        return "non_breast_excluded", "unknown_subtype", "unknown_setting"
 
-    lvef_low_matches  = _RE_LVEF_LOW.findall(criteria_lc)
-    lvef_high_matches = _RE_LVEF_HIGH.findall(criteria_lc)
+    # ---- Subtype detection -----------------------------------------------
+    is_tnbc     = bool(_RE_BC_TNBC.search(combined))
+    is_her2_pos = bool(_RE_BC_HER2_POS.search(combined))
+    is_her2_neg = bool(_RE_BC_HER2_NEG.search(combined))
+    is_hr_pos   = bool(_RE_BC_HR_POS.search(combined))
 
-    # Values are strings; cast to int for comparison
-    lvef_low_values  = [int(v) for v in lvef_low_matches]
-    lvef_high_values = [int(v) for v in lvef_high_matches]
+    # TNBC takes priority: ER-/PR-/HER2- by definition
+    if is_tnbc:
+        bc_subtype = "tnbc"
+    elif is_her2_pos and not is_her2_neg:
+        bc_subtype = "her2_positive"
+    elif is_hr_pos and (is_her2_neg or not is_her2_pos):
+        bc_subtype = "hr_positive"
+    else:
+        bc_subtype = "unknown_subtype"
 
-    # A low LVEF threshold ≤ ceiling confirms HFrEF eligibility
-    has_lvef_low  = bool(lvef_low_values and min(lvef_low_values) <= CT_HFREF_LVEF_CEILING)
-    # A high LVEF threshold ≥ 50 % is a preserved-EF gate (HFpEF signal)
-    has_lvef_high = bool(lvef_high_values and max(lvef_high_values) >= 50)
+    # ---- Setting detection -----------------------------------------------
+    is_neoadjuvant = bool(_RE_BC_NEOADJUVANT.search(combined))
+    is_adjuvant    = bool(_RE_BC_ADJUVANT.search(combined))
+    is_metastatic  = bool(_RE_BC_METASTATIC.search(combined))
 
-    # ---- Build audit note ------------------------------------------------
-    notes: list[str] = []
-    if hfref_kw:
-        notes.append("HFrEF keyword in title/conditions")
-    if lvef_low_values:
-        notes.append(f"LVEF ≤ {min(lvef_low_values)}% in eligibility criteria")
-    if hfpef_kw:
-        notes.append("HFpEF keyword detected")
-    if has_lvef_high:
-        notes.append(f"LVEF ≥ {max(lvef_high_values)}% gate in eligibility criteria")
-    if hfmref_kw:
-        notes.append("HFmrEF/borderline keyword detected")
-    if not notes:
-        notes.append("No ejection-fraction criteria found in available text")
+    if is_neoadjuvant and not is_adjuvant and not is_metastatic:
+        bc_setting = "neoadjuvant"
+    elif is_adjuvant and not is_neoadjuvant and not is_metastatic:
+        bc_setting = "adjuvant"
+    elif is_metastatic:
+        bc_setting = "metastatic"
+    elif is_neoadjuvant and is_adjuvant:
+        # Both signals present — typical of neo+adjuvant sequential trials
+        bc_setting = "neoadjuvant"
+    else:
+        bc_setting = "unknown_setting"
 
-    # ---- Classification logic --------------------------------------------
-    # Confirmed HFpEF: preserved-EF signal present, no reduced-EF signal.
-    if (hfpef_kw or has_lvef_high) and not hfref_kw and not has_lvef_low:
-        return "hfpef_excluded", "; ".join(notes)
+    # ---- Overall population class ----------------------------------------
+    # Flag trials where either dimension is unknown so the reviewer can
+    # verify before the pair enters endpoint pooling.
+    if bc_subtype == "unknown_subtype" or bc_setting == "unknown_setting":
+        population_class = "bc_flagged"
+    else:
+        population_class = "bc_confirmed"
 
-    # Confirmed HFrEF: explicit LVEF low threshold or HFrEF keyword, no
-    # conflicting preserved-EF signal.
-    if (hfref_kw or has_lvef_low) and not hfpef_kw and not has_lvef_high:
-        return "hfref_confirmed", "; ".join(notes)
-
-    # Mixed / borderline: HFmrEF keyword, or conflicting LVEF signals, or
-    # both HFrEF and HFpEF signals detected simultaneously.
-    if hfmref_kw or (has_lvef_low and has_lvef_high) or (hfref_kw and hfpef_kw):
-        return "mixed_flag", "; ".join(notes)
-
-    # Ambiguous: some HFrEF signal but paired with preserved-EF gate, or no
-    # EF criteria found at all.
-    return "ambiguous", "; ".join(notes)
+    return population_class, bc_subtype, bc_setting
 
 
 # ---------------------------------------------------------------------------
 # Step A — ClinicalTrials.gov fetch
 # ---------------------------------------------------------------------------
 
-def fetch_hfref_trials(max_records: Optional[int] = None) -> pd.DataFrame:
+def fetch_breast_cancer_trials(max_records: Optional[int] = None) -> pd.DataFrame:
     """
-    Fetch HFrEF Phase 2/3 RCTs from the ClinicalTrials.gov REST API v2.
+    Fetch breast cancer Phase 2/3 RCTs from the ClinicalTrials.gov REST API v2.
 
     Queries the API using the condition, phase, status, and date parameters
     defined in ``config.py``.  Returns one row per trial containing the
@@ -302,8 +339,8 @@ def fetch_hfref_trials(max_records: Optional[int] = None) -> pd.DataFrame:
     agg_filters = "results:with" if CT_REQUIRE_RESULTS else ""
 
     logger.info(
-        "Fetching HFrEF RCTs from ClinicalTrials.gov "
-        "(completion %s → %s, results-posted=%s)...",
+        "Fetching breast cancer RCTs from ClinicalTrials.gov "
+        "(completion %s to %s, results-posted=%s)...",
         CT_COMPLETION_START, CT_COMPLETION_END, CT_REQUIRE_RESULTS,
     )
 
@@ -365,8 +402,8 @@ def fetch_hfref_trials(max_records: Optional[int] = None) -> pd.DataFrame:
                 else (derived_pmids[0] if derived_pmids else "")
             )
 
-            # Population classifier — enforces HFrEF specificity post-fetch
-            pop_class, pop_notes = _classify_population(
+            # Population classifier — assigns breast cancer subtype and setting
+            pop_class, bc_subtype, bc_setting = _classify_population(
                 title                = official_title or brief_title,
                 conditions           = conditions,
                 eligibility_criteria = eligibility,
@@ -388,7 +425,8 @@ def fetch_hfref_trials(max_records: Optional[int] = None) -> pd.DataFrame:
                 ).get("date", ""),
                 "ctgov_pmid":                ctgov_pmid,
                 "population_class":          pop_class,
-                "population_notes":          pop_notes,
+                "bc_subtype":                bc_subtype,
+                "bc_setting":                bc_setting,
             })
 
             if max_records is not None and len(records) >= max_records:
@@ -408,42 +446,73 @@ def fetch_hfref_trials(max_records: Optional[int] = None) -> pd.DataFrame:
     df = df[df["nct_id"].str.startswith("NCT")].reset_index(drop=True)
 
     # ---- Population filter report ----------------------------------------
-    pop_counts = df["population_class"].value_counts().to_dict()
+    pop_counts    = df["population_class"].value_counts().to_dict()
+    subtype_cts   = df["bc_subtype"].value_counts().to_dict()
+    setting_cts   = df["bc_setting"].value_counts().to_dict()
     logger.info(
-        "Population classification — confirmed: %d | ambiguous: %d | "
-        "mixed: %d | hfpef_excluded: %d",
-        pop_counts.get("hfref_confirmed", 0),
-        pop_counts.get("ambiguous", 0),
-        pop_counts.get("mixed_flag", 0),
-        pop_counts.get("hfpef_excluded", 0),
+        "Population classification — bc_confirmed: %d | bc_flagged: %d | "
+        "non_breast_excluded: %d",
+        pop_counts.get("bc_confirmed", 0),
+        pop_counts.get("bc_flagged", 0),
+        pop_counts.get("non_breast_excluded", 0),
+    )
+    logger.info(
+        "Subtype breakdown — HER2+: %d | HR+/HER2-: %d | TNBC: %d | unknown: %d",
+        subtype_cts.get("her2_positive", 0),
+        subtype_cts.get("hr_positive", 0),
+        subtype_cts.get("tnbc", 0),
+        subtype_cts.get("unknown_subtype", 0),
+    )
+    logger.info(
+        "Setting breakdown — neoadjuvant: %d | adjuvant: %d | metastatic: %d | unknown: %d",
+        setting_cts.get("neoadjuvant", 0),
+        setting_cts.get("adjuvant", 0),
+        setting_cts.get("metastatic", 0),
+        setting_cts.get("unknown_setting", 0),
     )
 
-    # Remove confirmed HFpEF and any other explicitly excluded classes
+    # Remove non-breast trials returned by the broad API query
     excluded = df[df["population_class"].isin(CT_EXCLUDE_POPULATION_CLASSES)]
     if not excluded.empty:
         logger.info(
-            "Excluding %d trials with population_class in %s: %s",
+            "Excluding %d non-breast trials: %s",
             len(excluded),
-            CT_EXCLUDE_POPULATION_CLASSES,
             excluded["nct_id"].tolist(),
         )
     df = df[~df["population_class"].isin(CT_EXCLUDE_POPULATION_CLASSES)].reset_index(drop=True)
 
-    # Flag ambiguous / mixed trials for human review in the dashboard
-    n_flagged = df["population_class"].isin(["ambiguous", "mixed_flag"]).sum()
+    # Flag trials where subtype or setting could not be determined
+    n_flagged = df["population_class"].eq("bc_flagged").sum()
     if n_flagged:
         logger.warning(
-            "%d trials have ambiguous or mixed-population classification and "
-            "are flagged for human review before endpoint pooling.",
+            "%d trials have unknown subtype or setting and are flagged for "
+            "human review before endpoint pooling.",
             n_flagged,
         )
 
     n_registered = (df["primary_outcomes"] != "").sum()
     logger.info(
-        "CT.gov fetch complete: %d trials retained | with registered endpoint: %d",
+        "CT.gov fetch complete: %d breast cancer trials retained | "
+        "with registered endpoint: %d",
         len(df), n_registered,
     )
     return df
+
+
+def fetch_hfref_trials(max_records: Optional[int] = None) -> pd.DataFrame:
+    """
+    Backward-compatible alias retained for older callers.
+
+    The v3 pipeline now targets breast cancer. Existing scripts that still
+    import ``fetch_hfref_trials`` are redirected to
+    :func:`fetch_breast_cancer_trials` so the entrypoint does not break during
+    the indication transition.
+    """
+    logger.warning(
+        "fetch_hfref_trials() is deprecated in v3.0 and now redirects to "
+        "fetch_breast_cancer_trials()."
+    )
+    return fetch_breast_cancer_trials(max_records=max_records)
 
 
 # ---------------------------------------------------------------------------
@@ -557,7 +626,7 @@ def link_to_pubmed(
     Parameters
     ----------
     trials_df:
-        Output of :func:`fetch_hfref_trials`.  Must contain ``nct_id``,
+        Output of :func:`fetch_breast_cancer_trials`.  Must contain ``nct_id``,
         ``official_title``, ``brief_title``, ``completion_date``, and
         ``ctgov_pmid`` columns.
     linkage_log:

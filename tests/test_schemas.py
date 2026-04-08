@@ -36,7 +36,7 @@ class TestLinkageAuditEntry:
             linkage_confidence=LinkageConfidence.HIGH,
         )
         assert entry.nct_id == "NCT01234567"
-        assert entry.linked_by == "pipeline_v2.0"
+        assert entry.linked_by == "pipeline_v3.0"
 
     def test_nct_id_normalised_to_uppercase(self):
         entry = LinkageAuditEntry(

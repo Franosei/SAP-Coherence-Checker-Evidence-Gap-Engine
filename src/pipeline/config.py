@@ -11,14 +11,15 @@ running the pipeline or dashboard.
 Sections
 --------
 - Project paths
-- Embedding similarity thresholds  (Section 3.3.1)
-- LLM settings                     (Section 3.3.2)
-- ClinicalTrials.gov query params  (Section 3.2.1)
-- PubMed / NCBI E-utilities        (Section 3.1)
-- NCT-to-PMID linkage thresholds   (Section 3.2.2)
-- Bayesian model parameters        (Section 3.4.3)
-- Validation targets               (Section 5.2)
-- Human review governance          (Section 5.3)
+- Embedding similarity thresholds    (Section 3.3.1)
+- LLM settings                       (Section 3.3.2)
+- ClinicalTrials.gov query params    (Section 3.2.1)
+- Breast cancer population classifier
+- PubMed / NCBI E-utilities          (Section 3.1)
+- NCT-to-PMID linkage thresholds     (Section 3.2.2)
+- Bayesian model parameters          (Section 3.4.3)
+- Validation targets                 (Section 5.2)
+- Human review governance            (Section 5.3)
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ BAYES_TRACE_DIR: Path    = LOGS_DIR / "bayes_traces"
 
 # Bump this whenever a pipeline change would alter existing log entries.
 # A new version tag is required before any re-run that modifies the log.
-PIPELINE_VERSION: str = "pipeline_v2.0"
+PIPELINE_VERSION: str = "pipeline_v3.0"
 
 # ---------------------------------------------------------------------------
 # Embedding similarity routing thresholds (Section 3.3.1)
@@ -99,16 +100,16 @@ LLM_COST_PER_1K_OUTPUT_USD: float = 0.000_600
 CT_BASE_URL: str  = "https://clinicaltrials.gov/api/v2/studies"
 
 # Condition query terms — intentionally broad at the API level so we do not
-# miss trials registered as plain "Heart Failure" whose HFrEF specificity only
-# appears in the eligibility criteria (LVEF threshold).  The post-fetch
-# population classifier (``_classify_population`` in module1_linker) enforces
-# the stricter HFrEF boundary.
+# miss trials registered simply as "breast cancer".  The post-fetch population
+# classifier (``_classify_population`` in module1_linker) enforces the finer
+# subtype boundary (HER2+, HR+/HER2-, TNBC) and treatment setting
+# (neoadjuvant, adjuvant, metastatic).
 CT_CONDITIONS: list[str] = [
-    "heart failure with reduced ejection fraction",
-    "HFrEF",
-    "systolic heart failure",
-    "left ventricular systolic dysfunction",
-    "heart failure",   # catch-all for trials using the generic condition label
+    "breast cancer",
+    "breast neoplasm",
+    "breast carcinoma",
+    "HER2-positive breast cancer",
+    "triple negative breast cancer",
 ]
 
 CT_PHASES: list[str]      = ["PHASE2", "PHASE3"]
@@ -128,22 +129,28 @@ CT_COMPLETION_START: str = _fmt_date(
 CT_REQUIRE_RESULTS: bool = True  # aggFilters=results:with
 
 # ---------------------------------------------------------------------------
-# HFrEF population classifier thresholds (post-fetch filter)
+# Breast cancer population classifier (post-fetch filter)
 # ---------------------------------------------------------------------------
-# The classifier reads each trial's eligibility criteria text and title to
-# determine whether the enrolled population is HFrEF-specific.
+# The classifier reads each trial's eligibility criteria text, title, and
+# conditions list to assign a 2-D label: subtype × treatment setting.
 #
-# LVEF ceiling: trials requiring LVEF ≤ this value are classified as HFrEF.
-# Standard HFrEF threshold is 40 %; some landmark trials used 35 % or 45 %.
-# Setting this to 45 % captures all accepted HFrEF definitions while excluding
-# HFpEF trials (typically LVEF ≥ 50 %) and most HFmrEF trials (LVEF 40–49 %).
-CT_HFREF_LVEF_CEILING: int = 45
-
-# Trials classified as these statuses are removed from the dataset before
-# linkage and are written to the exclusion log with their reason code.
-# "hfpef_excluded" → confirmed HFpEF population, incompatible for pooling.
-# "ambiguous"      → kept in dataset but flagged; human reviewer decides.
-CT_EXCLUDE_POPULATION_CLASSES: list[str] = ["hfpef_excluded"]
+# Subtype classes  (bc_subtype column)
+# ------------------------------------
+# her2_positive    — HER2-positive (HER2+) / HER2-amplified
+# hr_positive      — HR+/HER2-negative (ER+ and/or PR+, HER2-)
+# tnbc             — Triple-negative (ER-, PR-, HER2-)
+# unknown_subtype  — Subtype not determinable from available text; kept with flag
+#
+# Setting classes  (bc_setting column)
+# -------------------------------------
+# neoadjuvant      — Pre-surgical treatment
+# adjuvant         — Post-surgical treatment
+# metastatic       — Advanced / metastatic disease
+# unknown_setting  — Setting not determinable from available text; kept with flag
+#
+# Trials classified as "non_breast_excluded" (i.e. the broad search returned
+# a non-breast oncology trial) are removed before linkage.
+CT_EXCLUDE_POPULATION_CLASSES: list[str] = ["non_breast_excluded"]
 
 # ---------------------------------------------------------------------------
 # PubMed / NCBI E-utilities (Section 3.1)
