@@ -82,5 +82,19 @@
     "extraction_method": "hr_semicolon_ci",
     "source_reference": "PMID:25176136 \u2014 (6.8% and 6.4%, respectively; hazard ratio, 1.08; 95% confidence interval, 0.96 to 1.20; P=0.20), nor were there sign",
     "registration_date": "2015-05-05"
+  },
+  {
+    "pair_id": "NCT02924727_34758252",
+    "nct_id": "NCT02924727",
+    "pmid": "34758252",
+    "hr": 0.91,
+    "hr_lci": 0.78,
+    "hr_uci": 1.07,
+    "log_hr": -0.094311,
+    "se_log_hr": 0.080643,
+    "variance": 0.00650329,
+    "extraction_method": "hr_semicolon_ci",
+    "source_reference": "PMID:34758252 \u2014 11.8%) in the ramipril group (hazard ratio, 0.91; 95% CI, 0.78 to 1.07); death from cardiovascular c",
+    "registration_date": "2016-10-04"
   }
 ]

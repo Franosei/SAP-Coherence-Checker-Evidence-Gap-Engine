@@ -1,5 +1,5 @@
 """
-SAP Coherence Checker — Audit Dashboard  (v2.0).
+SAP Coherence Checker - Audit Dashboard (v2.0).
 
 Run:
     python -m shiny run --reload --port 8080 src/dashboard/app.py
@@ -124,16 +124,61 @@ def kv(*pairs: str) -> ui.Tag:
     items: list[ui.Tag] = []
     it = iter(pairs)
     for key in it:
-        val = next(it, "—")
+        val = next(it, "")
         items += [
             ui.div(str(key), class_="kv-term"),
-            ui.div(str(val) if val else "—", class_="kv-def"),
+            ui.div(str(val) if val else "Not available", class_="kv-def"),
         ]
     return ui.div(*items, class_="kv-list")
 
 
 def info_box(message: str, tone: str = "info") -> ui.Tag:
     return ui.div(message, class_=f"alert alert-{tone}")
+
+
+def _reasoning_block(row: "pd.Series") -> list[ui.Tag]:
+    """
+    Build the AI reasoning disclosure widget for a decision log row.
+
+    Returns a list so it can be unpacked with ``*_reasoning_block(row)``
+    inside a parent ``ui.div()``.
+
+    - auto_concordant / auto_major_switch: explains that no LLM was needed.
+    - llm routing + reasoning present: shows the full reasoning in a <details>.
+    - llm routing + reasoning blank: explains the LLM response was invalid.
+    """
+    routing = str(row.get("routing", "")).strip()
+    reasoning = str(row.get("llm_reasoning", "")).strip()
+
+    if routing == "auto_concordant":
+        return [ui.div(
+            "No model reasoning recorded. This pair was auto-classified as concordant because the "
+            f"embedding similarity score ({fmt_num(row.get('similarity_score'), 3)}) was ≥ 0.90. "
+            "The AI model was not called.",
+            class_="alert alert-info",
+        )]
+
+    if routing == "auto_major_switch":
+        return [ui.div(
+            "No model reasoning recorded. This pair was auto-classified as a major switch because the "
+            f"embedding similarity score ({fmt_num(row.get('similarity_score'), 3)}) was < 0.50. "
+            "The AI model was not called.",
+            class_="alert alert-warning",
+        )]
+
+    # routing == "llm"
+    if not reasoning:
+        return [ui.div(
+            "The AI model was called for this pair but returned an invalid or empty response. "
+            "The pair has been flagged for human review.",
+            class_="alert alert-danger",
+        )]
+
+    return [ui.tags.details(
+        ui.tags.summary("View full AI reasoning (expand)"),
+        ui.tags.p(reasoning, class_="details-copy"),
+        class_="details-panel",
+    )]
 
 
 def brand_title() -> ui.Tag:
@@ -199,8 +244,18 @@ app_ui = ui.page_navbar(
                     ui.tags.hr(),
                     ui.output_data_frame("linkage_queue_table"),
                 ),
-                card("Selected trial — manual linkage review", ui.output_ui("linkage_case_panel")),
+                card("Selected trial: Manual Linkage Review", ui.output_ui("linkage_case_panel")),
                 class_="grid-2",
+            ),
+            card(
+                "Full Linkage Audit Log: All NCTs and Linked PMIDs",
+                ui.p(
+                    "Every NCT ID and every PMID the cascade considered, with the stage, "
+                    "confidence, and article-gate verdict. Use this to verify the cascade "
+                    "decisions and spot any NCT linked to multiple PMIDs.",
+                    class_="text-muted text-small",
+                ),
+                ui.output_data_frame("full_linkage_log_table"),
             ),
             class_="page-shell",
         ),
@@ -226,7 +281,7 @@ app_ui = ui.page_navbar(
                     ui.p("Recent decisions", style="font-weight:600; margin-bottom:8px;"),
                     ui.output_data_frame("recent_reviews_table"),
                 ),
-                card("Selected pair — review form", ui.output_ui("review_case_panel")),
+                card("Selected pair: Review Form", ui.output_ui("review_case_panel")),
                 class_="grid-2",
             ),
             class_="page-shell",
@@ -244,7 +299,7 @@ app_ui = ui.page_navbar(
                 ui.div(
                     ui.input_selectize("filter_routing", "Routing method",
                                        ROUTING_LABELS, multiple=True),
-                    ui.input_selectize("filter_confidence", "LLM confidence",
+                    ui.input_selectize("filter_confidence", "Model confidence",
                                        {"high": "High", "medium": "Medium", "low": "Low"},
                                        multiple=True),
                     ui.input_selectize("filter_decision", "Human decision",
@@ -747,7 +802,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         if queue.empty:
             return info_box("Linkage queue is clear.", "success")
         choices = {
-            str(row["nct_id"]): f"{row['nct_id']} — {safe_text(row.get('official_title') or row.get('brief_title'), 'Untitled trial')[:80]}"
+            str(row["nct_id"]): f"{row['nct_id']}: {safe_text(row.get('official_title') or row.get('brief_title'), 'Untitled trial')[:80]}"
             for _, row in queue.iterrows()
         }
         return ui.input_selectize(
@@ -774,6 +829,33 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         out.columns = ["nct_id", "pmid", "confidence", "method", "notes"]
         return out.reset_index(drop=True)
 
+    @render.data_frame
+    def full_linkage_log_table() -> pd.DataFrame:
+        """Show every entry in the linkage audit log: all NCTs and all linked PMIDs."""
+        log = linkage_frame()
+        if log.empty:
+            return pd.DataFrame(columns=[
+                "nct_id", "pmid", "confidence", "method", "linked_by", "timestamp", "notes"
+            ])
+        cols = {
+            "nct_id":              "nct_id",
+            "pmid":                "pmid",
+            "linkage_confidence":  "confidence",
+            "linkage_method":      "method",
+            "linked_by":           "linked_by",
+            "timestamp":           "timestamp",
+            "notes":               "notes",
+        }
+        # Keep only columns that actually exist in the log CSV
+        available = {k: v for k, v in cols.items() if k in log.columns}
+        out = log[list(available.keys())].copy()
+        out.columns = list(available.values())
+        # Sort: unlinked first, then low, medium, high; problems surface at top
+        conf_order = {"Unlinked": 0, "Low": 1, "Medium": 2, "High": 3}
+        out["_sort"] = out["confidence"].map(conf_order).fillna(99)
+        out = out.sort_values(["_sort", "nct_id"]).drop(columns=["_sort"]).reset_index(drop=True)
+        return out
+
     @render.ui
     def linkage_case_panel() -> ui.Tag:
         row = selected_linkage_row()
@@ -797,9 +879,9 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
                 ui.div(*header_links, class_="trial-id-row"),
                 ui.div(title, class_="trial-title-text"),
                 ui.div(
-                    ui.span(f"Current confidence: {safe_text(row.get('linkage_confidence'), '—')}", class_="trial-badge"),
-                    ui.span(f"Current method: {safe_text(row.get('linkage_method'), '—')}", class_="trial-badge"),
-                    ui.span(f"CT.gov result PMID: {safe_text(row.get('ctgov_pmid'), '—')}", class_="trial-badge"),
+                    ui.span(f"Current confidence: {safe_text(row.get('linkage_confidence'), 'Not set')}", class_="trial-badge"),
+                    ui.span(f"Current method: {safe_text(row.get('linkage_method'), 'Not set')}", class_="trial-badge"),
+                    ui.span(f"CT.gov result PMID: {safe_text(row.get('ctgov_pmid'), 'Not available')}", class_="trial-badge"),
                     class_="trial-badges",
                 ),
                 class_="trial-header",
@@ -897,8 +979,8 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         total    = len(frame)
         return ui.div(
             kpi_box("Trial pairs",    str(total),    "Linked trial-publication pairs in this run"),
-            kpi_box("Need review",    str(pending),  "Pairs the AI was not confident about — your review required", "warning"),
-            kpi_box("Reviewed",       str(reviewed), "Pairs you have already reviewed",                            "success"),
+            kpi_box("Review queue",   str(pending),  "Pairs awaiting reviewer decision",                           "warning"),
+            kpi_box("Reviewed",       str(reviewed), "Pairs reviewed",                                             "success"),
             kpi_box("Poolable",       str(poolable), "Pairs confirmed eligible for meta-analysis",                 "accent"),
             class_="kpi-grid",
         )
@@ -919,19 +1001,19 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
 
         lines = [
             f"The pipeline linked {len(frame)} HFrEF trial-publication pairs using the PubMed linkage cascade.",
-            f"{auto_conc} pairs had nearly identical endpoints (auto-confirmed).",
-            f"{auto_major} pairs had very different endpoints (auto-flagged as major switch).",
-            f"{len(frame[frame['routing']=='llm'])} pairs were sent to the AI model for closer inspection.",
+            f"{auto_conc} pairs were routed as concordant.",
+            f"{auto_major} pairs were routed as major switch.",
+            f"{len(frame[frame['routing']=='llm'])} pairs were sent to the model for adjudication.",
         ]
         if no_pub_ep:
             lines.append(
-                f"{no_pub_ep} pairs are missing a published endpoint — "
+                f"{no_pub_ep} pairs are missing a published endpoint. "
                 "PubMed/PMC did not return usable endpoint text. "
                 "These still need manual review."
             )
         if pending > 0:
             lines.append(
-                f"Action needed: go to Review Queue and work through the {pending} pending pair(s)."
+                f"{pending} pair(s) remain in the review queue."
             )
         else:
             lines.append("All pairs have been reviewed.")
@@ -955,11 +1037,11 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
             key_status = "present"
 
         if rate > OVERRIDE_RATE_HIGH_THRESHOLD:
-            note = f"{rate:.0%} — high, consider recalibrating thresholds"
+            note = f"{rate:.0%} (high: consider recalibrating similarity thresholds)"
         elif rate < OVERRIDE_RATE_LOW_THRESHOLD and len(reviewed) > 0:
-            note = f"{rate:.0%} — very low, check you are not over-trusting the AI"
+            note = f"{rate:.0%} (very low: verify you are not over-trusting the model)"
         else:
-            note = f"{rate:.0%} — normal range"
+            note = f"{rate:.0%} (within expected range)"
 
         return kv(
             "AI provider",    LLM_PROVIDER,
@@ -1011,7 +1093,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         return info_box(
             f"{pending} pair(s) need your review. "
             "For each pair, read the registered CT.gov endpoint and the published PubMed endpoint, then choose "
-            "Confirm (AI was right), Override (AI was wrong — pick the correct class), "
+            "Confirm (model was right), Override (model is wrong: pick the correct class), "
             "Exclude (pair should not be used), or Defer (come back later). "
             + (
                 f"{missing_pub} pair(s) are waiting on manual review because no published endpoint text was extracted. "
@@ -1037,7 +1119,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
             kpi_box("Sent to AI model",str(len(frame[frame["routing"] == "llm"])),
                     "Pairs in the ambiguous similarity zone"),
             kpi_box("Missing endpoint",str(len(frame[frame["published_endpoint"].eq("")])),
-                    "No published endpoint found — check these manually","danger"),
+                    "No published endpoint found. These pairs require manual endpoint extraction.","danger"),
             class_="kpi-grid",
         )
 
@@ -1118,12 +1200,12 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
             ui.div(*header_children, class_="trial-id-row"),
             ui.div(title or "Title not available", class_="trial-title-text"),
             ui.div(
-                ui.span(f"Phase: {phase or '—'}", class_="trial-badge"),
-                ui.span(f"Enrolled: {enrollment or '—'}", class_="trial-badge"),
-                ui.span(f"Completed: {completion or '—'}", class_="trial-badge"),
-                ui.span(f"Linkage: {linkage_confidence or '—'}", class_="trial-badge"),
-                ui.span(f"Method: {linkage_method or '—'}", class_="trial-badge"),
-                ui.span(f"Journal: {journal or '—'}", class_="trial-badge"),
+                ui.span(f"Phase: {phase or 'Not recorded'}", class_="trial-badge"),
+                ui.span(f"Enrolled: {enrollment or 'Not recorded'}", class_="trial-badge"),
+                ui.span(f"Completed: {completion or 'Not recorded'}", class_="trial-badge"),
+                ui.span(f"Linkage: {linkage_confidence or 'Not set'}", class_="trial-badge"),
+                ui.span(f"Method: {linkage_method or 'Not set'}", class_="trial-badge"),
+                ui.span(f"Journal: {journal or 'Not recorded'}", class_="trial-badge"),
                 class_="trial-badges",
             ),
             class_="trial-header",
@@ -1146,19 +1228,19 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         # --- Routing note ---
         if routing == "auto_major_switch":
             routing_note = (
-                f"Similarity score {score} — endpoints look very different. "
+                f"Similarity score {score}: endpoints look substantially different. "
                 "Auto-classified as major switch."
             )
             routing_tone = "danger"
         elif routing == "auto_concordant":
-            routing_note = f"Similarity score {score} — endpoints look semantically equivalent. Auto-classified as concordant."
+            routing_note = f"Similarity score {score}: endpoints appear semantically equivalent. Auto-classified as concordant."
             routing_tone = "success"
         else:
             ai_class = SWITCH_LABELS.get(str(row.get("llm_switch_type")), "")
             routing_note = (
-                f"Similarity score {score} — ambiguous. Sent to AI model. "
+                f"Similarity score {score}: ambiguous zone (0.50 to 0.89). Sent to the model for adjudication. "
                 + (f"AI classified as: {ai_class}." if ai_class
-                   else "AI could not classify — published endpoint text was missing or the response was invalid.")
+                   else "The model returned an invalid response. Review the endpoints manually.")
             )
             routing_tone = "warning"
 
@@ -1179,7 +1261,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
             # Endpoint comparison
             ui.div(
                 ui.div(
-                    ui.div("Registered endpoint (ClinicalTrials.gov — pre-specified)",
+                    ui.div("Registered endpoint (ClinicalTrials.gov, pre-specified)",
                            class_="endpoint-source"),
                     ui.div(reg_ep, class_="endpoint-text"),
                     class_="endpoint-box",
@@ -1197,30 +1279,24 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
             ui.div(
                 ui.div(f"Similarity score: {score}",                                                   class_="signal-item"),
                 ui.div(f"Switch index (SSI): {fmt_num(row.get('ssi'), 1)}",                            class_="signal-item"),
-                ui.div(f"AI classification: {SWITCH_LABELS.get(str(row.get('llm_switch_type')), '—')}", class_="signal-item"),
-                ui.div(f"AI confidence: {safe_text(row.get('llm_confidence'), '—')}",                  class_="signal-item"),
+                ui.div(f"AI classification: {SWITCH_LABELS.get(str(row.get('llm_switch_type')), 'Not classified')}", class_="signal-item"),
+                ui.div(f"AI confidence: {safe_text(row.get('llm_confidence'), 'Not called')}",         class_="signal-item"),
                 class_="signals-grid",
             ),
 
-            # Full AI reasoning chain
-            ui.tags.details(
-                ui.tags.summary("View full AI reasoning (expand)"),
-                ui.tags.p(safe_text(row.get("llm_reasoning"),
-                                    "No AI reasoning recorded for this pair."),
-                          class_="details-copy"),
-                class_="details-panel",
-            ),
+            # Full model reasoning chain -- shown only when the model was called
+            *_reasoning_block(row),
 
             # Review form
             ui.tags.hr(),
             ui.p("Your decision", style="font-weight:700; margin-bottom:12px;"),
             ui.input_select(
                 "review_decision", "Action",
-                {"":        "— choose —",
-                 "confirm": "Confirm — AI is correct",
-                 "override":"Override — AI is wrong, I am changing the classification",
-                 "exclude": "Exclude — this pair should not be used",
-                 "defer":   "Defer — come back later"},
+                {"":        "Select an action",
+                 "confirm": "Confirm: model classification is correct",
+                 "override": "Override: model is wrong, I am correcting the classification",
+                 "exclude": "Exclude: this pair should not be in the analysis",
+                 "defer":   "Defer: I will review this pair later"},
                 selected="",
             ),
             ui.input_select(
@@ -1236,7 +1312,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
                 "override_reason",
                 "Reason for override (required if action = Override)",
                 rows=3,
-                placeholder="e.g. Composite components changed — urgent visit removed.",
+                placeholder="e.g. Composite components changed: the published paper removed urgent hospitalisation from the composite.",
             ),
             ui.input_action_button("submit_review", "Save decision",
                                    class_="btn btn-primary"),
@@ -1303,7 +1379,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         return info_box(
             "This panel shows how the AI performed against the proposal's validation workflow. "
             "Use the template downloads above to build the 20-pair gold standard and the blinded 10% inter-rater sample. "
-            "The similarity score histogram shows where each pair sat on the 0–1 routing scale. "
+            "The similarity score histogram shows the embedding similarity distribution across all pairs. "
             + ("No inter-rater review file is loaded yet. " if inter_rater.empty else "")
             + (" ".join(recommended_actions) if recommended_actions else ""),
             "info",
@@ -1322,7 +1398,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
             else {}
         )
         return ui.div(
-            kpi_box("LLM call rate", fmt_pct(len(frame[frame["routing"] == "llm"]), len(frame)),
+            kpi_box("Model adjudication rate", fmt_pct(len(frame[frame["routing"] == "llm"]), len(frame)),
                     "Share of pairs sent to the AI model", "accent"),
             kpi_box("Gold AUC", fmt_num(calibration.get("auc"), 3, "-"),
                     "Target > 0.80", "primary"),
@@ -1349,7 +1425,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
             return empty_figure("Similarity scores", "No numeric scores yet.")
         plot["outcome"] = plot["human_final_class"].replace("", "not yet reviewed")
         fig = (px.histogram(plot, x="similarity_score", color="outcome", nbins=35,
-                            labels={"similarity_score": "Similarity score (0–1)",
+                            labels={"similarity_score": "Similarity score (0 to 1)",
                                     "outcome": "Human classification"})
                .update_layout(margin=dict(l=10, r=10, t=10, b=10)))
         fig.add_vline(x=0.90, line_dash="dash", line_color="#15896b",
@@ -1594,34 +1670,43 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         row = (frame.loc[frame["pair_id"] == pair_id].iloc[0]
                if pair_id in frame["pair_id"].values else frame.iloc[0])
 
-        nct_id  = str(row.get("pair_id", "")).split("_")[0]
-        linkage = linkage_frame()
-        if not linkage.empty:
-            linkage = linkage[linkage["nct_id"] == nct_id]
-        linkage_text = (
-            "No linkage entry."
-            if linkage.empty
-            else (f"{safe_text(linkage.iloc[0].get('linkage_method'))} / "
-                  f"confidence: {safe_text(linkage.iloc[0].get('linkage_confidence'))} / "
-                  f"PMID {safe_text(linkage.iloc[0].get('pmid'))}")
-        )
+        nct_id = str(row.get("pair_id", "")).split("_")[0]
+        this_pmid = pair_id.split("_")[-1] if "_" in pair_id else "Not linked"
 
-        return kv(
-            "NCT ID",                 nct_id,
-            "PMID",                   pair_id.split("_")[-1] if "_" in pair_id else "—",
-            "Linkage",                linkage_text,
-            "Registered endpoint",    safe_text(row.get("registered_endpoint")),
-            "Published endpoint",     safe_text(row.get("published_endpoint"), "None extracted"),
-            "Similarity score",       fmt_num(row.get("similarity_score"), 4),
-            "Routing",                ROUTING_LABELS.get(str(row.get("routing")), safe_text(row.get("routing"))),
-            "AI classification",      SWITCH_LABELS.get(str(row.get("llm_switch_type")), "—"),
-            "AI confidence",          safe_text(row.get("llm_confidence"), "—"),
-            "Human decision",         safe_text(row.get("human_decision"), "Not reviewed"),
-            "Human final class",      SWITCH_LABELS.get(str(row.get("human_final_class")), "—"),
-            "Poolable",               "Yes" if truthy(row.get("human_poolable")) else "No",
-            "Reviewer",               safe_text(row.get("reviewer_initials"), "—"),
-            "Override reason",        safe_text(row.get("override_reason"), "—"),
-            "Review timestamp",       safe_text(row.get("review_timestamp"), "—"),
+        # Show every linkage entry for this NCT, not just the first
+        log = linkage_frame()
+        nct_linkage = log[log["nct_id"] == nct_id] if not log.empty else pd.DataFrame()
+        if nct_linkage.empty:
+            linkage_text = "No linkage entry."
+        else:
+            parts = []
+            for _, lr in nct_linkage.iterrows():
+                pmid_str = safe_text(lr.get("pmid"), "Not available")
+                conf     = safe_text(lr.get("linkage_confidence"), "Unknown")
+                method   = safe_text(lr.get("linkage_method"), "Unknown")
+                parts.append(f"PMID {pmid_str} ({method} / {conf})")
+            linkage_text = " | ".join(parts)
+
+        return ui.div(
+            kv(
+                "NCT ID",              nct_id,
+                "Pair PMID",           this_pmid,
+                "All linked PMIDs",    linkage_text,
+                "Registered endpoint", safe_text(row.get("registered_endpoint")),
+                "Published endpoint",  safe_text(row.get("published_endpoint"), "None extracted"),
+                "Similarity score",    fmt_num(row.get("similarity_score"), 4),
+                "Routing",             ROUTING_LABELS.get(str(row.get("routing")), safe_text(row.get("routing"))),
+                "AI classification",   SWITCH_LABELS.get(str(row.get("llm_switch_type")), "Not classified"),
+                "AI confidence",       safe_text(row.get("llm_confidence"), "Not called"),
+                "Human decision",      safe_text(row.get("human_decision"), "Not reviewed"),
+                "Human final class",   SWITCH_LABELS.get(str(row.get("human_final_class")), "Pending review"),
+                "Poolable",            "Yes" if truthy(row.get("human_poolable")) else "No",
+                "Reviewer",            safe_text(row.get("reviewer_initials"), "Not yet reviewed"),
+                "Override reason",     safe_text(row.get("override_reason"), "No override"),
+                "Review timestamp",    safe_text(row.get("review_timestamp"), "Not yet reviewed"),
+            ),
+            ui.tags.hr(style="margin: 16px 0;"),
+            *_reasoning_block(row),
         )
 
     # ── Export ────────────────────────────────────────────────────────────
@@ -1641,7 +1726,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
             return info_box("Decision log is empty.", "info")
         return kv(
             "Total pairs",          str(summary.get("total_pairs", 0)),
-            "LLM call rate",        f"{summary.get('llm_call_rate_pct', 0)}%",
+            "Model adjudication rate",        f"{summary.get('llm_call_rate_pct', 0)}%",
             "Human review rate",    f"{summary.get('human_review_rate_pct', 0)}%",
             "Human override rate",  f"{summary.get('human_override_rate_pct', 0)}%",
         )

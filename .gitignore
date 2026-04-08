@@ -213,3 +213,4 @@ data/logs/bayes_traces/
 # Gold standard may contain real trial data — commit only the empty schema
 # data/gold_standard/gold_standard.csv  ← kept in version control (schema only)
 
+.env.example
