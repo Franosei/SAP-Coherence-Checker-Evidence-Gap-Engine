@@ -31,7 +31,7 @@ scikit-learn>=1.4.0
 # Dashboard
 plotly>=5.20.0
 shiny>=1.5.1
-shinywidgets>=0.7.1
+shinywidgets>=0.8.1
 
 # Testing
 pytest>=8.0.0

@@ -87,20 +87,22 @@ class LinkageLog:
         if df.empty:
             return {"total": 0}
 
-        total    = len(df)
+        total = len(df)
         conf_cts = df["linkage_confidence"].value_counts().to_dict()
         meth_cts = df["linkage_method"].value_counts().to_dict()
-        flagged  = df["linkage_confidence"].isin(
-            [LinkageConfidence.LOW.value, LinkageConfidence.UNLINKED.value]
-        ).sum()
+        flagged = (
+            df["linkage_confidence"]
+            .isin([LinkageConfidence.LOW.value, LinkageConfidence.UNLINKED.value])
+            .sum()
+        )
 
         return {
-            "total":                total,
-            "high":                 conf_cts.get("High", 0),
-            "medium":               conf_cts.get("Medium", 0),
-            "low":                  conf_cts.get("Low", 0),
-            "unlinked":             conf_cts.get("Unlinked", 0),
-            "flagged_for_review":   int(flagged),
+            "total": total,
+            "high": conf_cts.get("High", 0),
+            "medium": conf_cts.get("Medium", 0),
+            "low": conf_cts.get("Low", 0),
+            "unlinked": conf_cts.get("Unlinked", 0),
+            "flagged_for_review": int(flagged),
             "linkage_method_counts": meth_cts,
         }
 

@@ -24,6 +24,7 @@ from sklearn.metrics import (  # type: ignore
 )
 
 from src.pipeline.config import (
+    ENDPOINT_AUTO_ACCEPT,
     SPOT_CHECK_RATE,
     VALIDATION_LLM_LOW_CONF_FLAG_RATE,
     VALIDATION_TARGET_AUC,
@@ -33,11 +34,14 @@ from src.pipeline.config import (
 
 _VALID_SWITCH_TYPES = {
     "concordant",
+    "additional_outcome",
     "minor_modification",
     "moderate_switch",
     "major_switch",
 }
-_MODERATE_OR_ABOVE = {"moderate_switch", "major_switch"}
+# The outcome-switch verdicts — the study's finding. Every one is human-reviewed.
+_SWITCH_VERDICTS = {"moderate_switch", "major_switch"}
+_MODERATE_OR_ABOVE = _SWITCH_VERDICTS
 _REVIEWED_STATUSES = {"yes", "spot_check"}
 
 
@@ -99,9 +103,9 @@ def build_gold_standard_template(
             ]
         )
 
-    candidates = decision_log[
-        decision_log["registered_endpoint"].fillna("").ne("")
-    ][["pair_id", "registered_endpoint", "published_endpoint", "routing"]].copy()
+    candidates = decision_log[decision_log["registered_endpoint"].fillna("").ne("")][
+        ["pair_id", "registered_endpoint", "published_endpoint", "routing"]
+    ].copy()
     if candidates.empty:
         return pd.DataFrame(
             columns=[
@@ -126,7 +130,11 @@ def build_gold_standard_template(
             continue
         selected_parts.append(_stable_sample(group, min(quota, len(group))))
 
-    selected = pd.concat(selected_parts, ignore_index=True) if selected_parts else candidates.iloc[0:0].copy()
+    selected = (
+        pd.concat(selected_parts, ignore_index=True)
+        if selected_parts
+        else candidates.iloc[0:0].copy()
+    )
     if len(selected) > sample_size:
         selected = _stable_sample(selected, sample_size)
 
@@ -157,23 +165,69 @@ def select_spot_check_pairs(
     decision_log: pd.DataFrame,
     rate: float = SPOT_CHECK_RATE,
 ) -> set[str]:
+    """Deterministically select a spot-check sample of the AUTO-ACCEPTED verdicts.
+
+    These are the confident "no switch / minor" calls the pipeline accepted
+    without individual review. Sampling a fixed fraction of them gives an
+    AI-human agreement rate for the poster's governance claim. The sample is
+    stratified across endpoint clusters where a cluster column is present.
     """
-    Deterministically select the proposal's 10% spot-check sample from auto-routed pairs.
-    """
-    if decision_log.empty or rate <= 0:
+    if decision_log.empty or rate <= 0 or "human_reviewed" not in decision_log.columns:
         return set()
 
-    auto_rows = decision_log[
-        decision_log["routing"].isin(["auto_concordant", "auto_major_switch"])
-    ]["pair_id"].dropna()
-    if auto_rows.empty:
+    auto = decision_log[decision_log["human_reviewed"].astype(str) == "auto_accepted"].copy()
+    auto = auto[auto["pair_id"].astype(str).str.strip() != ""]
+    if auto.empty:
         return set()
 
-    ordered = sorted(auto_rows, key=_stable_rank)
-    sample_size = min(len(ordered), int(len(ordered) * rate))
-    if sample_size <= 0:
+    strata_col = next(
+        (c for c in ("bc_setting", "bc_subtype") if c in auto.columns and auto[c].nunique() > 1),
+        None,
+    )
+    picked: set[str] = set()
+    groups = auto.groupby(strata_col) if strata_col else [("_all", auto)]
+    for _, grp in groups:
+        ordered = sorted(grp["pair_id"].astype(str), key=_stable_rank)
+        k = max(1, round(len(ordered) * rate)) if ordered else 0
+        picked.update(ordered[:k])
+    return picked
+
+
+def pairs_needing_human_review(decision_log: pd.DataFrame) -> set[str]:
+    """Pair ids that must be seen by a human.
+
+    = every outcome-switch verdict (moderate_switch / major_switch)
+      + every LLM-flagged / low-confidence / missing-endpoint pair
+      + the deterministic spot-check sample of the auto-accepted verdicts
+    minus anything a human has already resolved.
+    """
+    if decision_log.empty or "pair_id" not in decision_log.columns:
         return set()
-    return set(ordered[:sample_size])
+    dl = decision_log
+    pid = dl["pair_id"].astype(str)
+
+    def _col(name: str) -> pd.Series:
+        if name in dl.columns:
+            return dl[name].astype(str)
+        return pd.Series([""] * len(dl), index=dl.index)
+
+    is_switch = _col("llm_switch_type").isin(_SWITCH_VERDICTS)
+    flagged = _col("llm_flag").str.strip().str.lower().isin({"true", "1", "yes"})
+    low_conf = _col("llm_confidence").str.lower().eq("low")
+    no_endpoint = _col("published_endpoint").str.strip().eq("") & (
+        "published_endpoint" in dl.columns
+    )
+
+    need = set(pid[is_switch | flagged | low_conf | no_endpoint])
+    if ENDPOINT_AUTO_ACCEPT:
+        need |= select_spot_check_pairs(dl)
+    else:
+        # During recalibration every model verdict is a suggestion requiring a
+        # human decision, including rows previously marked auto_accepted.
+        need |= set(pid[_col("llm_switch_type").str.strip().ne("")])
+
+    done = set(pid[_col("human_reviewed").isin({"yes", "spot_check"})])
+    return need - done
 
 
 def build_inter_rater_template(
@@ -198,9 +252,9 @@ def build_inter_rater_template(
             ]
         )
 
-    reviewed = decision_log[
-        decision_log["human_reviewed"].isin(_REVIEWED_STATUSES)
-    ][["pair_id", "registered_endpoint", "published_endpoint"]].copy()
+    reviewed = decision_log[decision_log["human_reviewed"].isin(_REVIEWED_STATUSES)][
+        ["pair_id", "registered_endpoint", "published_endpoint"]
+    ].copy()
     if reviewed.empty:
         return pd.DataFrame(
             columns=[
@@ -271,7 +325,9 @@ def compute_ai_calibration(
 
     merged["gold_binary"] = merged["gold_switch_type"].ne("concordant").astype(int)
     merged["ai_binary"] = merged["ai_switch_type"].ne("concordant").astype(int)
-    merged["gold_moderate_or_above"] = merged["gold_switch_type"].isin(_MODERATE_OR_ABOVE).astype(int)
+    merged["gold_moderate_or_above"] = (
+        merged["gold_switch_type"].isin(_MODERATE_OR_ABOVE).astype(int)
+    )
     merged["ai_moderate_or_above"] = merged["ai_switch_type"].isin(_MODERATE_OR_ABOVE).astype(int)
 
     auc = None
@@ -293,11 +349,9 @@ def compute_ai_calibration(
     low_confidence_flag_rate = None
     if not low_confidence_rows.empty:
         low_confidence_flag_rate = (
-            (
-                low_confidence_rows["llm_flag"].astype(str).str.lower().isin({"true", "yes", "1"})
-                | low_confidence_rows["human_reviewed"].astype(str).str.lower().isin(_REVIEWED_STATUSES)
-            ).mean()
-        )
+            low_confidence_rows["llm_flag"].astype(str).str.lower().isin({"true", "yes", "1"})
+            | low_confidence_rows["human_reviewed"].astype(str).str.lower().isin(_REVIEWED_STATUSES)
+        ).mean()
 
     agreement = (merged["ai_switch_type"] == merged["gold_switch_type"]).mean()
 
@@ -370,7 +424,9 @@ def compute_inter_rater_reliability(
 
     poolable_agreement = None
     if "second_poolable" in merged.columns:
-        second_poolable = merged["second_poolable"].astype(str).str.lower().isin({"true", "yes", "1"})
+        second_poolable = (
+            merged["second_poolable"].astype(str).str.lower().isin({"true", "yes", "1"})
+        )
         first_poolable = merged["human_poolable"].astype(str).str.lower().isin({"true", "yes", "1"})
         poolable_agreement = (first_poolable == second_poolable).mean()
 
@@ -379,9 +435,7 @@ def compute_inter_rater_reliability(
         "cohen_kappa": round(float(kappa), 3),
         "classification_agreement_rate_pct": round(float(class_agreement) * 100, 1),
         "poolable_agreement_rate_pct": (
-            round(float(poolable_agreement) * 100, 1)
-            if poolable_agreement is not None
-            else None
+            round(float(poolable_agreement) * 100, 1) if poolable_agreement is not None else None
         ),
     }
 

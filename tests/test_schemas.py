@@ -27,6 +27,7 @@ from src.models.schemas import (
 # LinkageAuditEntry
 # ---------------------------------------------------------------------------
 
+
 class TestLinkageAuditEntry:
     def test_valid(self):
         entry = LinkageAuditEntry(
@@ -36,7 +37,7 @@ class TestLinkageAuditEntry:
             linkage_confidence=LinkageConfidence.HIGH,
         )
         assert entry.nct_id == "NCT01234567"
-        assert entry.linked_by == "pipeline_v3.0"
+        assert entry.linked_by == "pipeline_v4.0"
 
     def test_nct_id_normalised_to_uppercase(self):
         entry = LinkageAuditEntry(
@@ -68,6 +69,7 @@ class TestLinkageAuditEntry:
 # LLMEndpointClassification
 # ---------------------------------------------------------------------------
 
+
 class TestLLMEndpointClassification:
     def test_valid(self):
         result = LLMEndpointClassification(
@@ -86,7 +88,7 @@ class TestLLMEndpointClassification:
             LLMEndpointClassification(
                 switch_type=SwitchType.CONCORDANT,
                 direction=SwitchDirection.NONE,
-                step_by_step_reasoning="OK",   # too short
+                step_by_step_reasoning="OK",  # too short
                 confidence=LLMConfidence.HIGH,
                 comparability_for_pooling=True,
                 flag_for_human_review=False,
@@ -108,6 +110,7 @@ class TestLLMEndpointClassification:
 # DecisionLogEntry
 # ---------------------------------------------------------------------------
 
+
 class TestDecisionLogEntry:
     def test_from_layer1_auto_concordant(self):
         entry = DecisionLogEntry.from_layer1(
@@ -126,7 +129,7 @@ class TestDecisionLogEntry:
                 registered_endpoint="Endpoint A",
                 published_endpoint="Endpoint B",
                 similarity_score=0.80,
-                ssi=99.0,   # wrong: should be 20.0
+                ssi=99.0,  # wrong: should be 20.0
                 routing=EndpointRouting.LLM,
             )
 
@@ -143,13 +146,14 @@ class TestDecisionLogEntry:
                 routing=EndpointRouting.LLM,
                 human_reviewed=HumanReviewStatus.YES,
                 human_decision=HumanDecision.OVERRIDE,
-                override_reason=None,   # must be provided
+                override_reason=None,  # must be provided
             )
 
 
 # ---------------------------------------------------------------------------
 # EffectMeasure
 # ---------------------------------------------------------------------------
+
 
 class TestEffectMeasure:
     def test_from_raw_computes_correctly(self):

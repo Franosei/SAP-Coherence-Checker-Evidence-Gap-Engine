@@ -106,8 +106,22 @@ def test_templates_are_blinded_and_include_expected_columns() -> None:
     assert len(inter_rater_template) >= 1
 
 
-def test_select_spot_check_pairs_samples_only_auto_routed_rows() -> None:
-    decision_log = _decision_log_frame()
+def test_select_spot_check_pairs_samples_only_auto_accepted_rows() -> None:
+    decision_log = pd.DataFrame(
+        [
+            {"pair_id": "NCT001_111", "human_reviewed": "auto_accepted"},
+            {"pair_id": "NCT002_222", "human_reviewed": "yes"},
+            {"pair_id": "NCT003_333", "human_reviewed": "auto_accepted"},
+            {"pair_id": "NCT004_444", "human_reviewed": "no"},
+        ]
+    )
     pair_ids = select_spot_check_pairs(decision_log, rate=1.0)
 
     assert pair_ids == {"NCT001_111", "NCT003_333"}
+
+
+def test_pairs_needing_human_review_tolerates_missing_columns() -> None:
+    from src.pipeline.validation import pairs_needing_human_review
+
+    minimal = pd.DataFrame([{"pair_id": "NCT001_111", "llm_switch_type": "major_switch"}])
+    assert pairs_needing_human_review(minimal) == {"NCT001_111"}

@@ -11,11 +11,18 @@ Step 1 — ClinicalTrials.gov fetch  (Module 1, Step A)
     Query CT.gov for all breast cancer Phase 2/3 RCTs with posted results.
     Output: ``data/outputs/trials.csv``
 
-Step 2 — NCT-to-PMID linkage  (Module 1, Step B)
-    Link each registered trial to its published journal paper via the
-    3-stage PubMed linkage cascade.  Low-confidence links are flagged for
-    human review in the dashboard before downstream analysis proceeds.
+Step 2 — Publication-family construction  (Module 1, Step B)
+    Discover, classify, and retain every plausible trial publication. Trial
+    identity is a hard gate: identity-rejected candidates (common for citation
+    chained papers of a different trial) are kept only for audit. Publication
+    role and analysis stage are derived independently; an interim analysis is
+    never selected as the primary paper even when it covers the full randomized
+    cohort. Registry history is retrieved where possible and each trial is
+    marked ``endpoint_switch_assessable`` — False means "cannot tell", not
+    "no switch", and those trials are held out of endpoint scoring.
     Output: ``data/outputs/linked_trials.csv``
+             ``data/outputs/publication_family.csv``
+             ``data/outputs/registry_history.csv``
              ``data/logs/linkage_audit_log.csv``
 
 Step 3 — Endpoint coherence analysis  (Module 2)
@@ -28,7 +35,8 @@ Step 3 — Endpoint coherence analysis  (Module 2)
 Step 4 — HR extraction  (hr_extractor)
     Extract Hazard Ratio and 95% CI from PubMed abstracts for all High/Medium-
     confidence linked trials.  Failed extractions are flagged for manual entry.
-    Output: ``data/logs/power_audit_log.csv``
+    Output: ``data/outputs/effect_measures.json``
+             ``data/logs/effect_measure_log.csv``
 
 Step 5 — Bayesian sequential meta-analysis  (Module 3)
     Fit a random-effects Bayesian model on human-confirmed poolable trial pairs
@@ -55,28 +63,36 @@ import logging
 import pandas as pd
 
 from src.pipeline.config import (
+    BAYES_TRACE_DIR,
     DECISION_LOG_PATH,
+    EFFECT_MEASURE_LOG_PATH,
+    LINKAGE_CHECKPOINT_PATH,
     LINKAGE_LOG_PATH,
     OUTPUTS_DIR,
     POWER_AUDIT_LOG_PATH,
+    PUBLICATION_FAMILY_PATH,
+    REGISTRY_HISTORY_PATH,
+    SWITCHING_SUMMARY_PATH,
 )
 from src.pipeline.hr_extractor import extract_effect_measures
 from src.pipeline.module1_linker import fetch_breast_cancer_trials, link_to_pubmed
 from src.pipeline.module2_endpoint_matcher import run_endpoint_matching
 from src.pipeline.module4_power_audit import run_power_audit
-from src.pipeline.scorecard import build_scorecard, cluster_endpoints
+from src.pipeline.registry_history import build_registry_history
+from src.pipeline.scorecard import build_scorecard, build_switching_summary, cluster_endpoints
 
-OUTPUT_DIR           = OUTPUTS_DIR
-TRIALS_PATH          = OUTPUT_DIR / "trials.csv"
-LINKED_TRIALS_PATH   = OUTPUT_DIR / "linked_trials.csv"
-MATCHED_TRIALS_PATH  = OUTPUT_DIR / "matched_trials.csv"
+OUTPUT_DIR = OUTPUTS_DIR
+TRIALS_PATH = OUTPUT_DIR / "trials.csv"
+LINKED_TRIALS_PATH = OUTPUT_DIR / "linked_trials.csv"
+MATCHED_TRIALS_PATH = OUTPUT_DIR / "matched_trials.csv"
 EFFECT_MEASURES_PATH = OUTPUT_DIR / "effect_measures.json"
-SCORECARD_PATH       = OUTPUT_DIR / "scorecard.csv"
+SCORECARD_PATH = OUTPUT_DIR / "scorecard.csv"
 
 
 # ---------------------------------------------------------------------------
 # CLI argument parsing
 # ---------------------------------------------------------------------------
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -85,23 +101,29 @@ def parse_args() -> argparse.Namespace:
         epilog=__doc__,
     )
     parser.add_argument(
-        "--max-trials", type=int, default=0,
+        "--max-trials",
+        type=int,
+        default=0,
         help="Limit number of trials fetched from CT.gov (0 = no limit).",
     )
     parser.add_argument(
-        "--fresh-run", action="store_true",
+        "--fresh-run",
+        action="store_true",
         help="Delete all previous outputs and restart from scratch.",
     )
     parser.add_argument(
-        "--skip-linkage", action="store_true",
+        "--skip-linkage",
+        action="store_true",
         help="Skip Step 2 — reuse existing linked_trials.csv.",
     )
     parser.add_argument(
-        "--skip-matching", action="store_true",
+        "--skip-matching",
+        action="store_true",
         help="Stop after Step 2 linkage (no LLM calls).",
     )
     parser.add_argument(
-        "--skip-bayesian", action="store_true",
+        "--skip-bayesian",
+        action="store_true",
         help="Stop after Step 4 HR extraction (no Bayesian model).",
     )
     return parser.parse_args()
@@ -110,6 +132,7 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
+
 
 def configure_logging() -> None:
     logging.basicConfig(
@@ -126,6 +149,7 @@ def configure_logging() -> None:
 # Output management
 # ---------------------------------------------------------------------------
 
+
 def reset_outputs() -> None:
     """Delete all pipeline outputs so the run starts from a clean state."""
     targets = [
@@ -138,11 +162,23 @@ def reset_outputs() -> None:
         LINKAGE_LOG_PATH,
         LINKAGE_LOG_PATH.with_suffix(f"{LINKAGE_LOG_PATH.suffix}.lock"),
         POWER_AUDIT_LOG_PATH,
+        EFFECT_MEASURE_LOG_PATH,
+        SWITCHING_SUMMARY_PATH,
+        PUBLICATION_FAMILY_PATH,
+        LINKAGE_CHECKPOINT_PATH,
+        REGISTRY_HISTORY_PATH,
     ]
     for path in targets:
         if path.exists():
             path.unlink()
             logging.info("Removed: %s", path)
+
+    n_traces = 0
+    for trace in BAYES_TRACE_DIR.glob("trace_*.nc"):
+        trace.unlink()
+        n_traces += 1
+    if n_traces:
+        logging.info("Removed %d cached Bayesian trace(s)", n_traces)
 
 
 def _already_matched() -> set[str]:
@@ -164,6 +200,7 @@ def _already_matched() -> set[str]:
 # ---------------------------------------------------------------------------
 # Pipeline steps
 # ---------------------------------------------------------------------------
+
 
 def step1_fetch_trials(max_records: int | None, fresh_run: bool) -> pd.DataFrame:
     """
@@ -188,7 +225,7 @@ def step1_fetch_trials(max_records: int | None, fresh_run: bool) -> pd.DataFrame
 
 def step2_link_to_pubmed(trials: pd.DataFrame, skip: bool, fresh_run: bool) -> pd.DataFrame:
     """
-    Step 2 — NCT-to-PMID linkage cascade.
+    Step 2 — build publication families and identify a primary analysis conservatively.
 
     Reuses ``linked_trials.csv`` if it exists, ``--skip-linkage`` is set,
     and ``--fresh-run`` is not set.  This preserves previously completed
@@ -202,26 +239,50 @@ def step2_link_to_pubmed(trials: pd.DataFrame, skip: bool, fresh_run: bool) -> p
         logging.info("Step 2 — Reusing existing %s (--skip-linkage)", LINKED_TRIALS_PATH)
         linked = pd.read_csv(LINKED_TRIALS_PATH, dtype=str, keep_default_na=False)
         logging.info("  Loaded %d linked trials from file.", len(linked))
+        if "registered_primary_outcomes_for_comparison" not in linked.columns:
+            linked, history = build_registry_history(linked)
+            history.to_csv(REGISTRY_HISTORY_PATH, index=False)
+            linked.to_csv(LINKED_TRIALS_PATH, index=False)
         return linked
 
-    logging.info("Step 2 — Running NCT-to-PMID linkage cascade...")
-    linked = link_to_pubmed(trials)
-    linked.to_csv(LINKED_TRIALS_PATH, index=False)
-    logging.info(
-        "  Linkage complete. Saved %d rows to %s", len(linked), LINKED_TRIALS_PATH
+    resuming = LINKAGE_CHECKPOINT_PATH.exists() and not fresh_run
+    if resuming:
+        logging.info(
+            "Step 2 — Resuming linkage from checkpoint %s (delete it to start over).",
+            LINKAGE_CHECKPOINT_PATH,
+        )
+    else:
+        logging.info("Step 2 — Building and classifying publication families...")
+        # Fresh linkage build: clear any stale per-trial append targets.
+        for stale in (LINKAGE_CHECKPOINT_PATH, PUBLICATION_FAMILY_PATH):
+            stale.unlink(missing_ok=True)
+
+    linked = link_to_pubmed(
+        trials,
+        publication_family_path=PUBLICATION_FAMILY_PATH,
+        checkpoint_path=LINKAGE_CHECKPOINT_PATH,
     )
+    linked, history = build_registry_history(linked)
+    history.to_csv(REGISTRY_HISTORY_PATH, index=False)
+    linked.to_csv(LINKED_TRIALS_PATH, index=False)
+    LINKAGE_CHECKPOINT_PATH.unlink(missing_ok=True)  # linkage completed cleanly
+    logging.info("  Linkage complete. Saved %d rows to %s", len(linked), LINKED_TRIALS_PATH)
 
     # Governance summary
-    n_high     = (linked["linkage_confidence"] == "High").sum()
-    n_medium   = (linked["linkage_confidence"] == "Medium").sum()
-    n_low      = (linked["linkage_confidence"] == "Low").sum()
+    n_high = (linked["linkage_confidence"] == "High").sum()
+    n_medium = (linked["linkage_confidence"] == "Medium").sum()
+    n_low = (linked["linkage_confidence"] == "Low").sum()
     n_unlinked = (linked["linkage_confidence"] == "Unlinked").sum()
-    n_flagged  = (linked.get("linkage_flag", pd.Series()) != "").sum()
+    n_flagged = (linked.get("linkage_flag", pd.Series()) != "").sum()
 
     logging.info(
         "  Linkage distribution — High: %d | Medium: %d | Low: %d | "
         "Unlinked: %d | Flagged for human review: %d",
-        n_high, n_medium, n_low, n_unlinked, n_flagged,
+        n_high,
+        n_medium,
+        n_low,
+        n_unlinked,
+        n_flagged,
     )
     if n_flagged:
         logging.warning(
@@ -251,7 +312,8 @@ def step3_endpoint_matching(linked: pd.DataFrame) -> pd.DataFrame:
         todo = linked[~linked["nct_id"].isin(already_done)].copy()
         logging.info(
             "Step 3 — Checkpoint resume: %d already matched, %d remaining.",
-            len(already_done), len(todo),
+            len(already_done),
+            len(todo),
         )
     else:
         todo = linked.copy()
@@ -266,7 +328,11 @@ def step3_endpoint_matching(linked: pd.DataFrame) -> pd.DataFrame:
     # module2 now reads `published_endpoint` (from PubMed) rather than
     # `ctgov_reported_outcome` — the correct cross-source comparison.
     matched_subset = run_endpoint_matching(todo)
-    update_cols = [col for col in ["nct_id", "pmid", "pair_id", "similarity_score", "routing"] if col in matched_subset.columns]
+    update_cols = [
+        col
+        for col in ["nct_id", "pmid", "pair_id", "similarity_score", "routing"]
+        if col in matched_subset.columns
+    ]
     updates = matched_subset[update_cols].drop_duplicates(subset=["nct_id", "pmid"])
 
     if MATCHED_TRIALS_PATH.exists():
@@ -277,7 +343,9 @@ def step3_endpoint_matching(linked: pd.DataFrame) -> pd.DataFrame:
         updates = updates.drop_duplicates(subset=["nct_id", "pmid"], keep="last")
 
     matched = linked.drop(
-        columns=[col for col in ["pair_id", "similarity_score", "routing"] if col in linked.columns],
+        columns=[
+            col for col in ["pair_id", "similarity_score", "routing"] if col in linked.columns
+        ],
         errors="ignore",
     ).merge(
         updates,
@@ -291,35 +359,30 @@ def step3_endpoint_matching(linked: pd.DataFrame) -> pd.DataFrame:
 
 def step4_extract_hr(linked: pd.DataFrame) -> None:
     """
-    Step 4 — HR/CI extraction from PubMed abstracts.
+    Step 4 — primary-endpoint effect-measure extraction.
 
-    Attempts regex-based extraction for all High/Medium-confidence linked
-    trials.  Successful extractions are saved as JSON for Module 3.  Failed
-    extractions are written to the power audit log and flagged for manual entry.
-
-    Skips extraction if ``effect_measures.json`` already exists and
-    ``--fresh-run`` is not set.
+    Regex cascade first; LLM reads the full abstract + Results + Conclusion on
+    failure and returns the primary-endpoint HR / OR / RR, or reports that no
+    poolable ratio exists (pCR / ORR trials). Resumable via the effect-measure
+    log (``data/logs/effect_measure_log.csv``, rewritten each run, one row per
+    pair) — a re-run does not repay LLM calls for pairs already attempted, but
+    does retry bare regex failures from an earlier run.
     """
-    if EFFECT_MEASURES_PATH.exists():
-        logging.info("Step 4 — Reusing existing %s", EFFECT_MEASURES_PATH)
-        return
-
-    logging.info("Step 4 — Extracting HR/CI from PubMed abstracts...")
+    logging.info("Step 4 — Extracting primary-endpoint effect measures...")
     effect_measures = extract_effect_measures(linked)
 
     serialised = [em.model_dump() for em in effect_measures]
-    EFFECT_MEASURES_PATH.write_text(
-        json.dumps(serialised, indent=2, default=str), encoding="utf-8"
-    )
+    EFFECT_MEASURES_PATH.write_text(json.dumps(serialised, indent=2, default=str), encoding="utf-8")
     logging.info(
-        "  Extracted %d effect measures. Saved to %s", len(effect_measures), EFFECT_MEASURES_PATH
+        "  %d effect measures available. Saved to %s", len(effect_measures), EFFECT_MEASURES_PATH
     )
 
-    n_manual = sum(1 for em in effect_measures if "rr_or_fallback" in em.extraction_method)
+    n_manual = sum(
+        1 for em in effect_measures if any(t in em.extraction_method for t in ("or", "rr"))
+    )
     if n_manual:
         logging.warning(
-            "  %d trials used RR/OR fallback — these require manual verification "
-            "before entering the Bayesian model.",
+            "  %d trials used an OR/RR as an HR proxy — verify before the Bayesian model.",
             n_manual,
         )
 
@@ -355,7 +418,7 @@ def step5_bayesian(skip: bool, trials: pd.DataFrame) -> list[dict]:
     from src.models.schemas import EffectMeasure
     from src.pipeline.module3_bayesian import load_poolable_effects, run_sequential_analysis
 
-    raw_data     = json.loads(EFFECT_MEASURES_PATH.read_text(encoding="utf-8"))
+    raw_data = json.loads(EFFECT_MEASURES_PATH.read_text(encoding="utf-8"))
     all_measures = [EffectMeasure(**item) for item in raw_data]
 
     poolable_df = load_poolable_effects(all_measures)
@@ -388,17 +451,18 @@ def step5_bayesian(skip: bool, trials: pd.DataFrame) -> list[dict]:
     logging.info("Step 5b — Running power audit (Module 4)...")
     if not trials.empty:
         power_entries = run_power_audit(
-            trials_df          = trials,
-            sequential_results = sequential_results,
+            trials_df=trials,
+            sequential_results=sequential_results,
         )
         included = sum(1 for e in power_entries if e.excluded_reason is None)
-        biased   = sum(
-            1 for e in power_entries
-            if e.optimism_bias is not None and e.optimism_bias < -0.05
+        biased = sum(
+            1 for e in power_entries if e.optimism_bias is not None and e.optimism_bias < -0.05
         )
         logging.info(
             "  Power audit: %d included | %d excluded | %d with optimism bias > 0.05 HR units",
-            included, len(power_entries) - included, biased,
+            included,
+            len(power_entries) - included,
+            biased,
         )
     else:
         logging.warning("  Power audit skipped — trials DataFrame is empty.")
@@ -429,39 +493,67 @@ def step6_scorecard(matched: pd.DataFrame, sequential_results: list[dict]) -> No
 
     logging.info("Step 6 — Building evidence gap scorecard...")
 
-    # Cluster pairs by endpoint keyword matching
-    endpoint_clusters = cluster_endpoints(matched)
+    # Cluster pairs by endpoint keyword matching. The decision log — not
+    # matched_trials.csv — is the source that carries `pair_id` and the
+    # `registered_endpoint` text cluster_endpoints() needs.
+    dl = pd.read_csv(DECISION_LOG_PATH, dtype=str, keep_default_na=False)
+    endpoint_clusters = cluster_endpoints(dl)
     if not endpoint_clusters:
         logging.warning("Step 6 — No endpoint clusters produced; scorecard not generated.")
         return
 
-    # Build within-trial variance map {pair_id: se_log_hr^2} from effect measures
+    # Build per-pair effect map {pair_id: (log_hr, se_log_hr)} and within-trial
+    # variance map {pair_id: se_log_hr^2} from the extracted effect measures.
+    pair_effects: dict[str, tuple[float, float]] = {}
     within_trial_variances: dict[str, float] = {}
     if EFFECT_MEASURES_PATH.exists():
         from src.models.schemas import EffectMeasure
+
         raw = json.loads(EFFECT_MEASURES_PATH.read_text(encoding="utf-8"))
         for item in raw:
             em = EffectMeasure(**item)
             if em.se_log_hr and em.se_log_hr > 0:
-                within_trial_variances[em.pair_id] = round(em.se_log_hr ** 2, 8)
+                pair_effects[em.pair_id] = (float(em.log_hr), float(em.se_log_hr))
+                within_trial_variances[em.pair_id] = round(em.se_log_hr**2, 8)
 
-    # Build Bayesian summaries per cluster
-    # sequential_results is ordered by trial; associate the final result with
-    # whichever cluster the last trial belongs to. For a richer mapping we
-    # use the full-dataset final posterior for every cluster that has poolable
-    # trials (conservative — per-cluster Bayesian fitting is out of scope here
-    # but architecturally supported via bayesian_summaries parameter).
+    # Per-cluster Bayesian pooling — fit the random-effects model separately on
+    # each endpoint cluster's own human-confirmed poolable pairs. Clusters with
+    # no poolable effect measure get no pooled HR (an explicit evidence gap),
+    # never a copy of the global posterior.
     bayesian_summaries: dict[str, dict] = {}
-    if sequential_results:
-        from src.pipeline.module3_bayesian import summarise_posterior
-        final_idata = sequential_results[-1]["idata"]
-        final_summary = summarise_posterior(final_idata)
-        # Assign the full-dataset posterior to every cluster that has poolable pairs
-        dl = pd.read_csv(DECISION_LOG_PATH, dtype=str, keep_default_na=False)
+    if sequential_results and pair_effects:
+        import numpy as _np
+
+        from src.pipeline.module3_bayesian import (
+            fit_random_effects_model,
+            summarise_posterior,
+        )
+
         poolable_ids = set(dl.loc[dl["human_poolable"].str.lower() == "true", "pair_id"])
         for cluster_name, pair_ids in endpoint_clusters.items():
-            if any(pid in poolable_ids for pid in pair_ids):
-                bayesian_summaries[cluster_name] = final_summary
+            cluster_effects = [
+                pair_effects[pid]
+                for pid in pair_ids
+                if pid in poolable_ids and pid in pair_effects
+            ]
+            if not cluster_effects:
+                continue
+            log_hrs = _np.array([e[0] for e in cluster_effects], dtype=float)
+            se_log_hrs = _np.array([e[1] for e in cluster_effects], dtype=float)
+            idata = fit_random_effects_model(
+                log_hrs, se_log_hrs, label=f"cluster_{cluster_name}"
+            )
+            summary = summarise_posterior(idata)
+            summary["n_poolable_pairs"] = len(cluster_effects)
+            bayesian_summaries[cluster_name] = summary
+            logging.info(
+                "  Cluster %s pooled HR = %.3f (95%% CrI %.3f-%.3f) from %d pair(s)",
+                cluster_name,
+                summary["pooled_hr"],
+                summary["pooled_hr_cri_lower"],
+                summary["pooled_hr_cri_upper"],
+                len(cluster_effects),
+            )
 
     # Build power audit optimism bias map {nct_id: optimism_bias}
     power_audit_summary: dict[str, float] = {}
@@ -475,10 +567,10 @@ def step6_scorecard(matched: pd.DataFrame, sequential_results: list[dict]) -> No
                 pass
 
     scorecard_entries = build_scorecard(
-        endpoint_clusters      = endpoint_clusters,
-        bayesian_summaries     = bayesian_summaries if bayesian_summaries else None,
-        power_audit_summary    = power_audit_summary if power_audit_summary else None,
-        within_trial_variances = within_trial_variances if within_trial_variances else None,
+        endpoint_clusters=endpoint_clusters,
+        bayesian_summaries=bayesian_summaries if bayesian_summaries else None,
+        power_audit_summary=power_audit_summary if power_audit_summary else None,
+        within_trial_variances=within_trial_variances if within_trial_variances else None,
     )
 
     if not scorecard_entries:
@@ -488,9 +580,25 @@ def step6_scorecard(matched: pd.DataFrame, sequential_results: list[dict]) -> No
     scorecard_df = pd.DataFrame([e.model_dump() for e in scorecard_entries])
     SCORECARD_PATH.parent.mkdir(parents=True, exist_ok=True)
     scorecard_df.to_csv(SCORECARD_PATH, index=False)
-    logging.info(
-        "  Scorecard saved: %d clusters to %s", len(scorecard_entries), SCORECARD_PATH
-    )
+    logging.info("  Scorecard saved: %d clusters to %s", len(scorecard_entries), SCORECARD_PATH)
+
+    # Outcome-switching characterisation — overall, per cluster, per switch form.
+    switching_summary = build_switching_summary(endpoint_clusters)
+    if not switching_summary.empty:
+        switching_summary.to_csv(SWITCHING_SUMMARY_PATH, index=False)
+        overall = switching_summary[switching_summary["scope"] == "overall"].iloc[0]
+        logging.info(
+            "  Switching summary saved to %s — overall switch rate %.1f%% "
+            "(%d/%d assessable), %d human-confirmed, %d AI-only pending review, "
+            "AI-human agreement %s%%",
+            SWITCHING_SUMMARY_PATH,
+            overall["switch_rate_pct"],
+            overall["n_outcome_switch"],
+            overall["n_assessable"],
+            overall["n_human_confirmed_switch"],
+            overall["n_ai_only_switch_pending_review"],
+            overall["ai_human_agreement_pct"],
+        )
     for entry in scorecard_entries:
         logging.info(
             "  %-30s  included=%d  switch_rate=%.0f%%  strength=%s  HR=%s",
@@ -505,6 +613,7 @@ def step6_scorecard(matched: pd.DataFrame, sequential_results: list[dict]) -> No
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     args = parse_args()
@@ -526,8 +635,8 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     linked = step2_link_to_pubmed(
         trials,
-        skip      = args.skip_linkage,
-        fresh_run = args.fresh_run,
+        skip=args.skip_linkage,
+        fresh_run=args.fresh_run,
     )
 
     if args.skip_matching:

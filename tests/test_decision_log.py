@@ -14,6 +14,7 @@ from src.models.schemas import (
     DecisionLogEntry,
     EndpointRouting,
     HumanDecision,
+    LLMConfidence,
     SwitchType,
 )
 
@@ -84,14 +85,19 @@ class TestDecisionLog:
             )
 
     def test_pending_review_returns_correct_rows(self):
-        # LLM-routed → pending
-        self.log.append(_make_entry("NCT003_PMID003", 0.75, EndpointRouting.LLM))
-        # Auto-concordant → not pending
-        self.log.append(_make_entry("NCT004_PMID004", 0.97, EndpointRouting.AUTO_CONCORDANT))
+        # An outcome-switch verdict → always pending, however confident.
+        switch = _make_entry("NCT003_PMID003", 0.75, EndpointRouting.LLM)
+        switch.llm_switch_type = SwitchType.MAJOR_SWITCH
+        switch.llm_confidence = LLMConfidence.HIGH
+        self.log.append(switch)
+        # During recalibration, even a confident non-switch remains pending.
+        clean = _make_entry("NCT004_PMID004", 0.97, EndpointRouting.LLM)
+        clean.llm_switch_type = SwitchType.CONCORDANT
+        clean.llm_confidence = LLMConfidence.HIGH
+        self.log.append(clean)
 
         pending = self.log.pending_review()
-        assert len(pending) == 1
-        assert pending.iloc[0]["pair_id"] == "NCT003_PMID003"
+        assert list(pending["pair_id"]) == ["NCT003_PMID003", "NCT004_PMID004"]
 
     def test_unknown_pair_id_raises_keyerror(self):
         with pytest.raises(KeyError):

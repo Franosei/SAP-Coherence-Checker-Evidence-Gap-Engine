@@ -13,9 +13,7 @@ spurious endpoint comparisons or HR estimates to the analysis.
 
 Why this matters
 ----------------
-The NCT-to-PMID linkage cascade (module1_linker) finds candidate PMIDs by
-matching trial identifiers and titles.  A trial may have several associated
-PubMed records:
+ClinicalTrials.gov can link a trial to several PubMed records:
 
   - Protocol / design paper      — describes the planned analysis; no outcome data
   - Primary results paper        — the one we want; reports the pre-specified primary endpoint
@@ -67,10 +65,9 @@ Every classification produces an ``ArticleClassification`` dataclass containing:
 
 Integration
 -----------
-Called by ``module1_linker._cascade_link()`` immediately after a PubMed record is
-fetched.  A REJECT verdict causes the cascade to continue searching for other candidate
-PMIDs for the same trial.  An UNCERTAIN verdict keeps the candidate but sets
-``linkage_confidence = Low`` and flags the linkage log entry for human review.
+This standalone accept/reject gate is retained for backward compatibility. The
+v4 pipeline uses ``publication_family.classify_publication_role()`` so every
+candidate is kept and assigned a scientific role.
 
     from src.pipeline.article_classifier import classify_article, ArticleVerdict
 
@@ -100,24 +97,27 @@ logger = logging.getLogger(__name__)
 # Output types
 # ---------------------------------------------------------------------------
 
+
 class ArticleVerdict(str, Enum):
     """Final gate decision for a candidate PubMed record."""
-    ACCEPT    = "accept"     # Primary results paper — proceed with endpoint extraction
-    REJECT    = "reject"     # Definitively not a results paper — skip this PMID
+
+    ACCEPT = "accept"  # Primary results paper — proceed with endpoint extraction
+    REJECT = "reject"  # Definitively not a results paper — skip this PMID
     UNCERTAIN = "uncertain"  # Could not determine — flag for human review
 
 
 class ArticleType(str, Enum):
     """Fine-grained article type, for the audit log."""
-    PRIMARY_RESULTS     = "primary_results"
-    PROTOCOL            = "protocol"
-    SUBGROUP_POSTHOC    = "subgroup_posthoc"
-    SYSTEMATIC_REVIEW   = "systematic_review"
-    EDITORIAL_LETTER    = "editorial_letter"
-    PHARMACOKINETIC     = "pharmacokinetic"
-    SAFETY_REPORT       = "safety_report"
-    SECONDARY_ANALYSIS  = "secondary_analysis"
-    UNKNOWN             = "unknown"
+
+    PRIMARY_RESULTS = "primary_results"
+    PROTOCOL = "protocol"
+    SUBGROUP_POSTHOC = "subgroup_posthoc"
+    SYSTEMATIC_REVIEW = "systematic_review"
+    EDITORIAL_LETTER = "editorial_letter"
+    PHARMACOKINETIC = "pharmacokinetic"
+    SAFETY_REPORT = "safety_report"
+    SECONDARY_ANALYSIS = "secondary_analysis"
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -150,14 +150,15 @@ class ArticleClassification:
         Internal list of heuristic signals that contributed to the verdict.
         Included in the audit trail for transparency.
     """
-    pmid:            str
-    article_type:    ArticleType    = ArticleType.UNKNOWN
-    verdict:         ArticleVerdict = ArticleVerdict.UNCERTAIN
-    confidence:      str            = "low"
-    tier:            str            = "heuristic"
-    reason:          str            = ""
-    flag_for_review: bool           = True
-    signals:         list[str]      = field(default_factory=list)
+
+    pmid: str
+    article_type: ArticleType = ArticleType.UNKNOWN
+    verdict: ArticleVerdict = ArticleVerdict.UNCERTAIN
+    confidence: str = "low"
+    tier: str = "heuristic"
+    reason: str = ""
+    flag_for_review: bool = True
+    signals: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -165,32 +166,36 @@ class ArticleClassification:
 # ---------------------------------------------------------------------------
 
 # PubMed PublicationType values that strongly indicate a primary results paper.
-_ACCEPT_PUB_TYPES: frozenset[str] = frozenset({
-    "Randomized Controlled Trial",
-    "Clinical Trial, Phase II",
-    "Clinical Trial, Phase III",
-    "Clinical Trial, Phase IV",
-    "Multicenter Study",
-    "Clinical Trial",
-    "Controlled Clinical Trial",
-    "Equivalence Trial",
-})
+_ACCEPT_PUB_TYPES: frozenset[str] = frozenset(
+    {
+        "Randomized Controlled Trial",
+        "Clinical Trial, Phase II",
+        "Clinical Trial, Phase III",
+        "Clinical Trial, Phase IV",
+        "Multicenter Study",
+        "Clinical Trial",
+        "Controlled Clinical Trial",
+        "Equivalence Trial",
+    }
+)
 
 # PubMed PublicationType values that definitively indicate a non-results paper.
-_REJECT_PUB_TYPES: frozenset[str] = frozenset({
-    "Study Protocol",
-    "Clinical Study Design",
-    "Meta-Analysis",
-    "Systematic Review",
-    "Review",
-    "Editorial",
-    "Letter",
-    "Comment",
-    "News",
-    "Biography",
-    "Published Erratum",
-    "Retraction of Publication",
-})
+_REJECT_PUB_TYPES: frozenset[str] = frozenset(
+    {
+        "Study Protocol",
+        "Clinical Study Design",
+        "Meta-Analysis",
+        "Systematic Review",
+        "Review",
+        "Editorial",
+        "Letter",
+        "Comment",
+        "News",
+        "Biography",
+        "Published Erratum",
+        "Retraction of Publication",
+    }
+)
 
 # Title words/phrases that signal a protocol, design, or review paper.
 _REJECT_TITLE_PATTERNS: re.Pattern = re.compile(
@@ -223,19 +228,27 @@ _REJECT_TITLE_PATTERNS: re.Pattern = re.compile(
 
 # MeSH terms that indicate the article is *about* a clinical trial rather
 # than *reporting* one (e.g. methodological or systematic review articles).
-_REJECT_MESH_TERMS: frozenset[str] = frozenset({
-    "Clinical Trial as Topic",
-    "Randomized Controlled Trials as Topic",
-    "Meta-Analysis as Topic",
-    "Systematic Reviews as Topic",
-    "Research Design",
-})
+_REJECT_MESH_TERMS: frozenset[str] = frozenset(
+    {
+        "Clinical Trial as Topic",
+        "Randomized Controlled Trials as Topic",
+        "Meta-Analysis as Topic",
+        "Systematic Reviews as Topic",
+        "Research Design",
+    }
+)
 
 # Abstract section labels or lead phrases that confirm the paper reports results.
-_RESULTS_SECTION_LABELS: frozenset[str] = frozenset({
-    "RESULTS", "FINDINGS", "OUTCOMES", "MAIN RESULTS",
-    "MAIN OUTCOME MEASURES", "RESULTS AND DISCUSSION",
-})
+_RESULTS_SECTION_LABELS: frozenset[str] = frozenset(
+    {
+        "RESULTS",
+        "FINDINGS",
+        "OUTCOMES",
+        "MAIN RESULTS",
+        "MAIN OUTCOME MEASURES",
+        "RESULTS AND DISCUSSION",
+    }
+)
 
 # Abstract keyword patterns that confirm primary outcome reporting.
 _RESULTS_ABSTRACT_PATTERNS: re.Pattern = re.compile(
@@ -272,6 +285,7 @@ _PROTOCOL_ABSTRACT_PATTERNS: re.Pattern = re.compile(
 # Tier 1 — heuristic classifier
 # ---------------------------------------------------------------------------
 
+
 def _heuristic_classify(record: PubMedRecord) -> ArticleClassification:
     """
     Apply deterministic heuristics to classify the article type.
@@ -294,8 +308,8 @@ def _heuristic_classify(record: PubMedRecord) -> ArticleClassification:
         Verdict with all contributing signals listed in ``signals``.
     """
     signals: list[str] = []
-    reject_score = 0   # positive integer — higher = more confident rejection
-    accept_score = 0   # positive integer — higher = more confident acceptance
+    reject_score = 0  # positive integer — higher = more confident rejection
+    accept_score = 0  # positive integer — higher = more confident acceptance
 
     # ---- Publication type tags -------------------------------------------
     reject_types = record.pub_types & _REJECT_PUB_TYPES
@@ -303,7 +317,7 @@ def _heuristic_classify(record: PubMedRecord) -> ArticleClassification:
 
     for pt in reject_types:
         signals.append(f"pub_type:REJECT:{pt}")
-        reject_score += 3   # pub type is a strong signal
+        reject_score += 3  # pub type is a strong signal
 
     for pt in accept_types:
         signals.append(f"pub_type:ACCEPT:{pt}")
@@ -316,8 +330,11 @@ def _heuristic_classify(record: PubMedRecord) -> ArticleClassification:
         reject_score += 3
 
     # ---- MeSH terms -------------------------------------------------------
-    reject_mesh = record.mesh_terms & _REJECT_MESH_TERMS if isinstance(record.mesh_terms, set) \
+    reject_mesh = (
+        record.mesh_terms & _REJECT_MESH_TERMS
+        if isinstance(record.mesh_terms, set)
         else set(record.mesh_terms) & _REJECT_MESH_TERMS
+    )
     for term in reject_mesh:
         signals.append(f"mesh:REJECT:{term}")
         reject_score += 2
@@ -329,11 +346,15 @@ def _heuristic_classify(record: PubMedRecord) -> ArticleClassification:
         accept_score += 2
 
     # ---- Abstract text patterns ------------------------------------------
+    has_results_text = False
+    has_protocol_text = False
     if record.abstract_text:
-        if _RESULTS_ABSTRACT_PATTERNS.search(record.abstract_text):
+        has_results_text = bool(_RESULTS_ABSTRACT_PATTERNS.search(record.abstract_text))
+        has_protocol_text = bool(_PROTOCOL_ABSTRACT_PATTERNS.search(record.abstract_text))
+        if has_results_text:
             signals.append("abstract:ACCEPT:primary_outcome_language_detected")
             accept_score += 2
-        if _PROTOCOL_ABSTRACT_PATTERNS.search(record.abstract_text):
+        if has_protocol_text:
             signals.append("abstract:REJECT:protocol_future_tense_language_detected")
             reject_score += 3
 
@@ -350,67 +371,73 @@ def _heuristic_classify(record: PubMedRecord) -> ArticleClassification:
         # Unambiguous: only reject pub types, no accept pub types
         article_type = _map_pub_type_to_article_type(reject_types)
         return ArticleClassification(
-            pmid         = record.pmid,
-            article_type = article_type,
-            verdict      = ArticleVerdict.REJECT,
-            confidence   = "high",
-            tier         = "heuristic",
-            reason       = (
-                f"Publication type(s) definitively non-results: "
-                f"{', '.join(sorted(reject_types))}."
+            pmid=record.pmid,
+            article_type=article_type,
+            verdict=ArticleVerdict.REJECT,
+            confidence="high",
+            tier="heuristic",
+            reason=(
+                f"Publication type(s) definitively non-results: {', '.join(sorted(reject_types))}."
             ),
-            flag_for_review = False,
-            signals      = signals,
+            flag_for_review=False,
+            signals=signals,
         )
 
-    if accept_types and not reject_types and not title_match and not reject_mesh:
-        # Unambiguous acceptance: RCT/clinical trial pub types, no reject signals
+    if (
+        accept_types
+        and not reject_types
+        and not title_match
+        and not reject_mesh
+        and not has_protocol_text
+        and (result_sections or has_results_text)
+    ):
+        # Unambiguous acceptance: RCT/clinical trial pub types plus results evidence.
         return ArticleClassification(
-            pmid         = record.pmid,
-            article_type = ArticleType.PRIMARY_RESULTS,
-            verdict      = ArticleVerdict.ACCEPT,
-            confidence   = "high",
-            tier         = "heuristic",
-            reason       = (
+            pmid=record.pmid,
+            article_type=ArticleType.PRIMARY_RESULTS,
+            verdict=ArticleVerdict.ACCEPT,
+            confidence="high",
+            tier="heuristic",
+            reason=(
                 f"Publication type(s) confirm results paper: "
                 f"{', '.join(sorted(accept_types))}."
                 + (" Results section present." if result_sections else "")
             ),
-            flag_for_review = False,
-            signals      = signals,
+            flag_for_review=False,
+            signals=signals,
         )
 
     if reject_score >= accept_score + 3:
         # Reject score dominates clearly — confident rejection without LLM
         return ArticleClassification(
-            pmid         = record.pmid,
-            article_type = ArticleType.UNKNOWN,
-            verdict      = ArticleVerdict.REJECT,
-            confidence   = "medium",
-            tier         = "heuristic",
-            reason       = (
+            pmid=record.pmid,
+            article_type=ArticleType.UNKNOWN,
+            verdict=ArticleVerdict.REJECT,
+            confidence="medium",
+            tier="heuristic",
+            reason=(
                 f"Heuristic signals strongly favour rejection "
                 f"(reject_score={reject_score}, accept_score={accept_score}). "
                 f"Signals: {'; '.join(signals[:5])}."
             ),
-            flag_for_review = True,  # medium confidence — flag for spot-check
-            signals      = signals,
+            flag_for_review=True,  # medium confidence — flag for spot-check
+            signals=signals,
         )
 
     # Insufficient or conflicting signals → escalate to LLM
     return ArticleClassification(
-        pmid         = record.pmid,
-        article_type = ArticleType.UNKNOWN,
-        verdict      = ArticleVerdict.UNCERTAIN,
-        confidence   = "low",
-        tier         = "heuristic",
-        reason       = (
+        pmid=record.pmid,
+        article_type=ArticleType.UNKNOWN,
+        verdict=ArticleVerdict.UNCERTAIN,
+        confidence="low",
+        tier="heuristic",
+        reason=(
             f"Heuristic signals inconclusive "
             f"(reject_score={reject_score}, accept_score={accept_score}). "
             "Escalating to LLM arbiter."
         ),
-        flag_for_review = True,
-        signals      = signals,
+        flag_for_review=True,
+        signals=signals,
     )
 
 
@@ -501,29 +528,31 @@ def _call_llm_arbiter(record: PubMedRecord) -> Optional[ArticleClassification]:
 
     try:
         import openai  # type: ignore
+
         client = openai.OpenAI(api_key=api_key, base_url=LLM_BASE_URL)
     except ImportError:
         logger.warning("openai package not available — LLM arbiter skipped.")
         return None
 
     user_content = _LLM_USER_TEMPLATE.format(
-        title      = record.title or "(not available)",
-        pub_types  = ", ".join(sorted(record.pub_types)) or "(not available)",
-        journal    = record.journal or "(not available)",
-        pub_year   = record.pub_year or "(not available)",
-        abstract   = (record.abstract_text[:1_500] if record.abstract_text
-                      else "(no abstract available)"),
+        title=record.title or "(not available)",
+        pub_types=", ".join(sorted(record.pub_types)) or "(not available)",
+        journal=record.journal or "(not available)",
+        pub_year=record.pub_year or "(not available)",
+        abstract=(
+            record.abstract_text[:1_500] if record.abstract_text else "(no abstract available)"
+        ),
     )
 
     try:
         response = client.chat.completions.create(
-            model           = LLM_MODEL_PRIMARY,
-            max_tokens      = 512,
-            temperature     = 0.0,
-            response_format = {"type": "json_object"},
+            model=LLM_MODEL_PRIMARY,
+            max_tokens=512,
+            temperature=0.0,
+            response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": _LLM_SYSTEM_PROMPT},
-                {"role": "user",   "content": user_content},
+                {"role": "user", "content": user_content},
             ],
         )
     except Exception as exc:
@@ -539,45 +568,51 @@ def _call_llm_arbiter(record: PubMedRecord) -> Optional[ArticleClassification]:
     except json.JSONDecodeError as exc:
         logger.warning(
             "LLM arbiter returned invalid JSON for PMID %s: %s\nRaw: %s",
-            record.pmid, exc, raw[:300],
+            record.pmid,
+            exc,
+            raw[:300],
         )
         return None
 
     # Map string values to enums, with safe fallbacks
     verdict_map = {
-        "accept":    ArticleVerdict.ACCEPT,
-        "reject":    ArticleVerdict.REJECT,
+        "accept": ArticleVerdict.ACCEPT,
+        "reject": ArticleVerdict.REJECT,
         "uncertain": ArticleVerdict.UNCERTAIN,
     }
     type_map = {t.value: t for t in ArticleType}
 
-    verdict      = verdict_map.get(str(parsed.get("verdict", "")).lower(), ArticleVerdict.UNCERTAIN)
+    verdict = verdict_map.get(str(parsed.get("verdict", "")).lower(), ArticleVerdict.UNCERTAIN)
     article_type = type_map.get(str(parsed.get("article_type", "")).lower(), ArticleType.UNKNOWN)
-    confidence   = str(parsed.get("confidence", "low")).lower()
-    reason       = str(parsed.get("reason", "LLM arbiter verdict."))
-    step1        = str(parsed.get("step1_signals", ""))
-    step2        = str(parsed.get("step2_reasoning", ""))
+    confidence = str(parsed.get("confidence", "low")).lower()
+    reason = str(parsed.get("reason", "LLM arbiter verdict."))
+    step1 = str(parsed.get("step1_signals", ""))
+    step2 = str(parsed.get("step2_reasoning", ""))
 
     logger.debug(
         "LLM arbiter PMID %s → %s (%s) | %s",
-        record.pmid, verdict.value, confidence, reason,
+        record.pmid,
+        verdict.value,
+        confidence,
+        reason,
     )
 
     return ArticleClassification(
-        pmid         = record.pmid,
-        article_type = article_type,
-        verdict      = verdict,
-        confidence   = confidence,
-        tier         = "llm",
-        reason       = f"[LLM] {reason} | Step1: {step1[:200]} | Step2: {step2[:200]}",
-        flag_for_review = verdict == ArticleVerdict.UNCERTAIN or confidence == "low",
-        signals      = [f"llm_step1:{step1[:200]}", f"llm_step2:{step2[:200]}"],
+        pmid=record.pmid,
+        article_type=article_type,
+        verdict=verdict,
+        confidence=confidence,
+        tier="llm",
+        reason=f"[LLM] {reason} | Step1: {step1[:200]} | Step2: {step2[:200]}",
+        flag_for_review=verdict == ArticleVerdict.UNCERTAIN or confidence == "low",
+        signals=[f"llm_step1:{step1[:200]}", f"llm_step2:{step2[:200]}"],
     )
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def classify_article(record: PubMedRecord) -> ArticleClassification:
     """
@@ -600,8 +635,7 @@ def classify_article(record: PubMedRecord) -> ArticleClassification:
     Returns
     -------
     ArticleClassification
-        The final verdict.  The caller in ``module1_linker._cascade_link()``
-        should:
+        The final verdict. A standalone caller may:
           - ACCEPT  → continue with linkage as normal
           - REJECT  → skip this PMID and try the next candidate
           - UNCERTAIN → keep candidate but set linkage_confidence = Low
@@ -616,30 +650,29 @@ def classify_article(record: PubMedRecord) -> ArticleClassification:
     try:
         heuristic = _heuristic_classify(record)
     except Exception as exc:
-        logger.error(
-            "Heuristic classifier failed for PMID %s: %s", record.pmid, exc, exc_info=True
-        )
+        logger.error("Heuristic classifier failed for PMID %s: %s", record.pmid, exc, exc_info=True)
         return ArticleClassification(
-            pmid         = record.pmid,
-            verdict      = ArticleVerdict.UNCERTAIN,
-            confidence   = "low",
-            tier         = "heuristic",
-            reason       = f"Classifier error: {exc}",
-            flag_for_review = True,
+            pmid=record.pmid,
+            verdict=ArticleVerdict.UNCERTAIN,
+            confidence="low",
+            tier="heuristic",
+            reason=f"Classifier error: {exc}",
+            flag_for_review=True,
         )
 
     if heuristic.verdict != ArticleVerdict.UNCERTAIN:
         # Tier 1 is confident — no LLM needed
         logger.info(
             "Article gate PMID %s → %s (%s, heuristic) | %s",
-            record.pmid, heuristic.verdict.value, heuristic.confidence, heuristic.reason,
+            record.pmid,
+            heuristic.verdict.value,
+            heuristic.confidence,
+            heuristic.reason,
         )
         return heuristic
 
     # Tier 1 uncertain → invoke LLM arbiter
-    logger.info(
-        "Article gate PMID %s → Tier 1 uncertain; calling LLM arbiter...", record.pmid
-    )
+    logger.info("Article gate PMID %s → Tier 1 uncertain; calling LLM arbiter...", record.pmid)
     llm_result = _call_llm_arbiter(record)
 
     if llm_result is None:
@@ -654,7 +687,10 @@ def classify_article(record: PubMedRecord) -> ArticleClassification:
             llm_result.flag_for_review = llm_result.verdict == ArticleVerdict.REJECT
         logger.info(
             "Article gate PMID %s → %s (%s, llm) | %s",
-            record.pmid, llm_result.verdict.value, llm_result.confidence, llm_result.reason,
+            record.pmid,
+            llm_result.verdict.value,
+            llm_result.confidence,
+            llm_result.reason,
         )
 
     return llm_result

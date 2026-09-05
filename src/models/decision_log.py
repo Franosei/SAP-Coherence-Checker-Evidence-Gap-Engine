@@ -20,7 +20,7 @@ import portalocker
 
 from src.models.schemas import DecisionLogEntry, HumanDecision, HumanReviewStatus, SwitchType
 from src.pipeline.config import DECISION_LOG_PATH, PIPELINE_VERSION
-from src.pipeline.validation import select_spot_check_pairs
+from src.pipeline.validation import pairs_needing_human_review
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,17 @@ _COLUMNS: list[str] = [
     "llm_confidence",
     "llm_comparability",
     "llm_flag",
+    "llm_disclosed_exploratory",
+    "llm_results_driven",
+    "llm_switch_forms",
+    "llm_confidence_score",
+    "llm_classification_label",
+    "llm_primary_endpoint_match",
+    "llm_published_primary_extracted",
+    "llm_actual_change_evidence",
+    "llm_missing_detail_only",
+    "llm_adjudication_guardrail",
+    "llm_endpoint_comparisons",
     "human_reviewed",
     "human_decision",
     "human_final_class",
@@ -67,6 +78,8 @@ class DecisionLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self._initialise_csv()
+        else:
+            self._ensure_schema()
 
     # ------------------------------------------------------------------
     # Public API
@@ -134,18 +147,18 @@ class DecisionLog:
         )
 
     def pending_review(self) -> pd.DataFrame:
-        """Return rows that require human review but have not yet been actioned."""
+        """Return rows that require human review but have not yet been actioned.
+
+        The queue is every outcome-switch verdict + every flagged / low-confidence
+        / missing-endpoint pair + the deterministic spot-check sample of the
+        auto-accepted verdicts, minus anything a human has already resolved
+        (see ``validation.pairs_needing_human_review``).
+        """
         df = self.read()
-        spot_check_pairs = select_spot_check_pairs(df)
-        needs_review = (
-            (df["routing"] == "llm")
-            | (df["llm_confidence"].str.lower() == "low")
-            | (df["llm_flag"].str.lower().isin(["true", "yes", "1"]))
-            | (df["published_endpoint"] == "")
-            | (df["pair_id"].isin(spot_check_pairs))
-        )
-        not_yet_reviewed = df["human_reviewed"] == "no"
-        return df[needs_review & not_yet_reviewed].reset_index(drop=True)
+        if df.empty:
+            return df
+        need = pairs_needing_human_review(df)
+        return df[df["pair_id"].isin(need)].reset_index(drop=True)
 
     def governance_summary(self) -> dict:
         """Compute the governance metrics required for the methods paper."""
@@ -168,14 +181,10 @@ class DecisionLog:
         return {
             "total_pairs": total,
             "routing_pct": routing_counts.to_dict(),
-            "llm_call_rate_pct": round(
-                len(df[df["routing"] == "llm"]) / total * 100, 1
-            ),
+            "llm_call_rate_pct": round(len(df[df["routing"] == "llm"]) / total * 100, 1),
             "llm_confidence_distribution_pct": llm_conf_counts.to_dict(),
             "human_review_rate_pct": round(len(reviewed) / total * 100, 1),
-            "human_override_rate_pct": round(
-                len(overrides) / max(len(reviewed), 1) * 100, 1
-            ),
+            "human_override_rate_pct": round(len(overrides) / max(len(reviewed), 1) * 100, 1),
         }
 
     # ------------------------------------------------------------------
@@ -187,6 +196,22 @@ class DecisionLog:
             writer = csv.DictWriter(handle, fieldnames=_COLUMNS)
             writer.writeheader()
         logger.info("DecisionLog: initialised new log at %s", self.path)
+
+    def _ensure_schema(self) -> None:
+        """Add newly introduced audit columns without changing review decisions."""
+        try:
+            frame = pd.read_csv(self.path, dtype=str, keep_default_na=False)
+        except pd.errors.EmptyDataError:
+            self._initialise_csv()
+            return
+        missing = [column for column in _COLUMNS if column not in frame.columns]
+        if not missing:
+            return
+        for column in missing:
+            frame[column] = ""
+        extra = [column for column in frame.columns if column not in _COLUMNS]
+        frame[_COLUMNS + extra].to_csv(self.path, index=False)
+        logger.info("DecisionLog: added schema columns: %s", ", ".join(missing))
 
     def _entry_to_row(self, entry: DecisionLogEntry) -> dict:
         data = entry.model_dump()

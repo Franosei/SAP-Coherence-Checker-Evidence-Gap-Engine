@@ -1,13 +1,9 @@
 """
 PubMed / NCBI E-utilities client.
 
-Provides a thin, typed interface over the NCBI E-utilities REST API for the
-two operations the pipeline requires:
-
-  esearch  — find PubMed article identifiers (PMIDs) by NCT ID secondary
-             identifier, by free-text title query, or by author + year.
-  efetch   — retrieve a full PubMed article record (XML), parse it into a
-             structured ``PubMedRecord`` dataclass.
+Provides a thin, typed interface over NCBI EFetch. It retrieves one or more
+PMIDs supplied by ClinicalTrials.gov and parses them into ``PubMedRecord``
+instances.
 
 Rate-limiting
 -------------
@@ -20,17 +16,15 @@ Error handling
 --------------
 All public functions raise ``requests.HTTPError`` on non-2xx responses and
 ``xml.etree.ElementTree.ParseError`` on malformed XML.  Callers that need
-graceful degradation (e.g. the linkage cascade) should catch these explicitly
+graceful degradation should catch these explicitly
 rather than catching bare ``Exception``.
 
 Usage
 -----
-    from src.pipeline.pubmed_client import PubMedClient, jaccard_token_similarity
+    from src.pipeline.pubmed_client import PubMedClient
 
     client = PubMedClient()
-    pmids  = client.search_by_nct_id("NCT01520558")
-    record = client.fetch_record(pmids[0])
-    score  = jaccard_token_similarity(trial_title, record.title)
+    records = client.fetch_records_batch(["26030518", "26947331"])
 """
 
 from __future__ import annotations
@@ -49,15 +43,19 @@ from src.pipeline.config import (
     PUBMED_BASE_URL,
     PUBMED_RATE_LIMIT_S,
     PUBMED_REQUEST_TIMEOUT_S,
-    PUBMED_SEARCH_MAX_RESULTS,
 )
 
 logger = logging.getLogger(__name__)
+
+# Transient-failure retry (DNS/connection drops, NCBI 429/5xx).
+_MAX_RETRIES = 4
+_RETRY_BACKOFF_S = 2.0
 
 
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class PubMedRecord:
@@ -77,10 +75,18 @@ class PubMedRecord:
     abstract_sections:
         Mapping of section label (e.g. ``"RESULTS"``, ``"METHODS"``) to the
         corresponding abstract text.  Empty for unstructured abstracts.
+    results_text:
+        Text from structured abstract sections that report trial results, if
+        PubMed exposes labelled sections.
+    conclusion_text:
+        Text from structured abstract conclusion / interpretation sections, if
+        available.
     authors:
         List of author last names in publication order.
     pub_year:
         Four-digit publication year as a string, or ``""`` if absent.
+    pub_date:
+        ISO publication date when PubMed supplies year, month, and day.
     journal:
         Journal name (MedlineTA abbreviation preferred, full title fallback).
     mesh_terms:
@@ -91,73 +97,61 @@ class PubMedRecord:
         Used by the article-type gate (``article_classifier.py``) to detect
         protocol papers, systematic reviews, and editorials before they enter
         the endpoint matching pipeline.
+    doi:
+        Digital Object Identifier when supplied in the PubMed record.
+    nct_ids:
+        ClinicalTrials.gov identifiers found in PubMed secondary identifiers,
+        the title, or the abstract.
     """
 
     pmid: str
     title: str
     abstract_text: str
     abstract_sections: dict[str, str] = field(default_factory=dict)
+    results_text: str = ""
+    conclusion_text: str = ""
     authors: list[str] = field(default_factory=list)
     pub_year: str = ""
+    pub_date: str = ""
     journal: str = ""
     mesh_terms: list[str] = field(default_factory=list)
     pub_types: set[str] = field(default_factory=set)
+    doi: str = ""
+    nct_ids: set[str] = field(default_factory=set)
 
 
-# ---------------------------------------------------------------------------
-# Standalone utilities
-# ---------------------------------------------------------------------------
+_RESULT_SECTION_LABELS: tuple[str, ...] = (
+    "RESULTS",
+    "RESULT",
+    "FINDINGS",
+    "MAIN RESULTS",
+    "OUTCOMES",
+    "MAIN OUTCOME MEASURE",
+    "MAIN OUTCOME MEASURES",
+    "RESULTS AND DISCUSSION",
+)
 
-def jaccard_token_similarity(text_a: str, text_b: str) -> float:
-    """
-    Compute Jaccard similarity between the token sets of two strings.
-
-    Tokens are lower-cased alphabetic words (punctuation stripped).  This
-    mirrors the approach specified in Section 3.2.2 of the proposal for
-    title-based fuzzy matching in the NCT-to-PMID linkage cascade.
-
-    Parameters
-    ----------
-    text_a, text_b:
-        The two strings to compare.
-
-    Returns
-    -------
-    float
-        Value in [0.0, 1.0].  Returns 0.0 when either string is empty.
-
-    Examples
-    --------
-    >>> jaccard_token_similarity(
-    ...     "KATHERINE: Trastuzumab Emtansine versus Trastuzumab in HER2-positive breast cancer",
-    ...     "Adjuvant trastuzumab emtansine for residual invasive HER2-positive breast cancer",
-    ... )
-    0.2857...
-    """
-    def _tokenise(text: str) -> set[str]:
-        return {w.lower() for w in re.findall(r"[a-zA-Z]+", text) if len(w) > 1}
-
-    tokens_a = _tokenise(text_a)
-    tokens_b = _tokenise(text_b)
-
-    if not tokens_a or not tokens_b:
-        return 0.0
-
-    intersection = tokens_a & tokens_b
-    union = tokens_a | tokens_b
-    return round(len(intersection) / len(union), 4)
+_CONCLUSION_SECTION_LABELS: tuple[str, ...] = (
+    "CONCLUSION",
+    "CONCLUSIONS",
+    "CONCLUSIONS AND RELEVANCE",
+    "INTERPRETATION",
+    "INTERPRETATIONS",
+    "DISCUSSION",
+)
 
 
 # ---------------------------------------------------------------------------
 # PubMed API client
 # ---------------------------------------------------------------------------
 
+
 class PubMedClient:
     """
     Stateful NCBI E-utilities client with integrated rate limiting.
 
-    A single instance is intended to be shared across the entire NCT-to-PMID
-    linkage run so that the rate-limit sleep is applied consistently.
+    A single instance is intended to be shared across a publication-selection
+    run so that the rate-limit sleep is applied consistently.
 
     Parameters
     ----------
@@ -173,103 +167,67 @@ class PubMedClient:
         api_key: str = NCBI_API_KEY,
         rate_limit_s: float = PUBMED_RATE_LIMIT_S,
     ) -> None:
-        self._api_key      = api_key
+        self._api_key = api_key
         self._rate_limit_s = rate_limit_s
         self._last_call_ts: float = 0.0
-        self._session      = requests.Session()
+        self._session = requests.Session()
         self._session.headers.update({"User-Agent": "SAP-Coherence-Checker/3.0 (research)"})
+        # PMID -> parsed record. A PMID reached through several trials' citation
+        # chains is fetched and parsed once.
+        self._record_cache: dict[str, PubMedRecord] = {}
 
     # ------------------------------------------------------------------
-    # Public search methods
+    # Candidate discovery
     # ------------------------------------------------------------------
 
-    def search_by_nct_id(self, nct_id: str) -> list[str]:
-        """
-        Search PubMed for articles whose secondary identifier matches *nct_id*.
+    def search(self, term: str, max_results: int = 50) -> list[str]:
+        """Return PubMed IDs matching an Entrez query."""
+        if not term.strip():
+            return []
+        url = f"{PUBMED_BASE_URL}/esearch.fcgi"
+        params = {
+            "db": "pubmed",
+            "term": term,
+            "retmax": max_results,
+            "retmode": "json",
+            "sort": "relevance",
+        }
+        if self._api_key:
+            params["api_key"] = self._api_key
+        data = self._get(url, params).json()
+        return data.get("esearchresult", {}).get("idlist", [])
 
-        This is Stage 1 of the NCT-to-PMID linkage cascade (Section 3.2.2).
-        The ``[si]`` field tag targets the secondary identifier field, which is
-        populated by investigators when they submit trial results to PubMed.
+    def search_by_trial_id(self, nct_id: str, max_results: int = 100) -> list[str]:
+        """Find every PubMed record that indexes or mentions an exact NCT ID."""
+        nct_id = nct_id.strip().upper()
+        return self.search(f'({nct_id}[si] OR "{nct_id}"[tiab])', max_results=max_results)
 
-        Parameters
-        ----------
-        nct_id:
-            ClinicalTrials.gov NCT identifier, e.g. ``"NCT01520558"``.
-
-        Returns
-        -------
-        list[str]
-            PMIDs found, ordered by PubMed relevance score.  Empty list if
-            no match.
-        """
-        term = f"{nct_id}[si]"
-        pmids = self._esearch(term, max_results=PUBMED_SEARCH_MAX_RESULTS)
-        logger.debug("search_by_nct_id(%s) → %d result(s): %s", nct_id, len(pmids), pmids)
-        return pmids
-
-    def search_by_title(self, title: str, max_results: int = PUBMED_SEARCH_MAX_RESULTS) -> list[str]:
-        """
-        Search PubMed using title words to find candidate articles.
-
-        This is Stage 2 of the NCT-to-PMID linkage cascade.  The query uses
-        the ``[title]`` field tag to restrict matches to article titles, which
-        reduces false positives from abstracts containing similar language.
-
-        Callers should subsequently call :func:`jaccard_token_similarity` to
-        score each candidate against the registered trial title before
-        accepting a match.
-
-        Parameters
-        ----------
-        title:
-            Trial official or brief title from ClinicalTrials.gov.
-        max_results:
-            Maximum number of PMIDs to return.
-
-        Returns
-        -------
-        list[str]
-            Candidate PMIDs, ordered by PubMed relevance.
-        """
-        # Strip non-alphanumeric characters that would break the esearch query
-        clean = re.sub(r"[^\w\s]", " ", title).strip()
-        if not clean:
+    def citation_neighbors(self, pmids: list[str], max_results: int = 100) -> list[str]:
+        """Return PubMed references and citing papers for confirmed seed PMIDs."""
+        unique = list(dict.fromkeys(str(pmid).strip() for pmid in pmids if str(pmid).strip()))
+        if not unique:
             return []
 
-        # Use the first 12 significant words to keep the query focused and
-        # avoid hitting the URL length limit for very long titles.
-        words = [w for w in clean.split() if len(w) > 2][:12]
-        term = " ".join(words) + "[title]"
-
-        pmids = self._esearch(term, max_results=max_results)
-        logger.debug("search_by_title(%r…) → %d result(s)", title[:60], len(pmids))
-        return pmids
-
-    def search_by_author_and_year(self, last_name: str, pub_year: str) -> list[str]:
-        """
-        Search PubMed for articles by a specific first author in a given year.
-
-        This is Stage 3 of the NCT-to-PMID linkage cascade, applied to
-        disambiguate medium-confidence title matches.
-
-        Parameters
-        ----------
-        last_name:
-            First author's last (family) name from a candidate PubMed record.
-        pub_year:
-            Four-digit publication year string, e.g. ``"2021"``.
-
-        Returns
-        -------
-        list[str]
-            Candidate PMIDs.
-        """
-        term = f"{last_name}[1au] AND {pub_year}[dp]"
-        pmids = self._esearch(term, max_results=PUBMED_SEARCH_MAX_RESULTS)
-        logger.debug(
-            "search_by_author_and_year(%s, %s) → %d result(s)", last_name, pub_year, len(pmids)
-        )
-        return pmids
+        neighbors: list[str] = []
+        for link_name in ("pubmed_pubmed_refs", "pubmed_pubmed_citedin"):
+            url = f"{PUBMED_BASE_URL}/elink.fcgi"
+            params: list[tuple[str, str]] = [
+                ("dbfrom", "pubmed"),
+                ("db", "pubmed"),
+                ("linkname", link_name),
+                ("retmode", "xml"),
+            ]
+            params.extend(("id", pmid) for pmid in unique)
+            if self._api_key:
+                params.append(("api_key", self._api_key))
+            root = ET.fromstring(self._get(url, params).text)
+            for element in root.findall(".//LinkSetDb/Link/Id"):
+                value = (element.text or "").strip()
+                if value and value not in unique and value not in neighbors:
+                    neighbors.append(value)
+                    if len(neighbors) >= max_results:
+                        return neighbors
+        return neighbors
 
     # ------------------------------------------------------------------
     # Record fetching
@@ -299,10 +257,14 @@ class PubMedClient:
         xml.etree.ElementTree.ParseError
             If the response body is not valid XML.
         """
-        url    = f"{PUBMED_BASE_URL}/efetch.fcgi"
+        key = str(pmid).strip()
+        if key in self._record_cache:
+            return self._record_cache[key]
+
+        url = f"{PUBMED_BASE_URL}/efetch.fcgi"
         params = {
-            "db":      "pubmed",
-            "id":      pmid,
+            "db": "pubmed",
+            "id": pmid,
             "rettype": "xml",
             "retmode": "xml",
         }
@@ -310,33 +272,84 @@ class PubMedClient:
             params["api_key"] = self._api_key
 
         response = self._get(url, params)
-        root     = ET.fromstring(response.text)
-        record   = self._parse_article(root, pmid)
+        root = ET.fromstring(response.text)
+        record = self._parse_article(root, pmid)
+        self._record_cache[key] = record
         logger.debug("fetch_record(%s) → title=%r", pmid, record.title[:60])
         return record
 
-    # ------------------------------------------------------------------
-    # Private helpers — NCBI HTTP layer
-    # ------------------------------------------------------------------
+    def fetch_records_batch(self, pmids: list[str]) -> dict[str, "PubMedRecord"]:
+        """
+        Retrieve multiple PubMed records in a single efetch call.
 
-    def _esearch(self, term: str, max_results: int) -> list[str]:
-        """Execute an esearch query and return a list of PMIDs."""
-        url    = f"{PUBMED_BASE_URL}/esearch.fcgi"
-        params = {
-            "db":       "pubmed",
-            "term":     term,
-            "retmax":   max_results,
-            "retmode":  "json",
-            "usehistory": "n",
+        NCBI efetch accepts a comma-separated ``id`` list, so this replaces
+        N sequential ``fetch_record`` calls with one API round-trip.  Rate
+        limiting still applies (one sleep before the single request).
+
+        Parameters
+        ----------
+        pmids:
+            List of PubMed identifiers to fetch.  Duplicates are de-duplicated
+            before the request is issued.
+
+        Returns
+        -------
+        dict[str, PubMedRecord]
+            Mapping of PMID → PubMedRecord for every record successfully
+            parsed from the response.  PMIDs absent from the PubMed response
+            (e.g. retracted records) are silently omitted.
+        """
+        unique = list(dict.fromkeys(str(p).strip() for p in pmids if str(p).strip()))
+        if not unique:
+            return {}
+
+        records: dict[str, PubMedRecord] = {p: self._record_cache[p] for p in unique if p in self._record_cache}
+        to_fetch = [p for p in unique if p not in records]
+        if not to_fetch:
+            return records
+
+        url = f"{PUBMED_BASE_URL}/efetch.fcgi"
+        params: dict = {
+            "db": "pubmed",
+            "id": ",".join(to_fetch),
+            "rettype": "xml",
+            "retmode": "xml",
         }
         if self._api_key:
             params["api_key"] = self._api_key
 
         response = self._get(url, params)
-        data     = response.json()
-        return data.get("esearchresult", {}).get("idlist", [])
+        root = ET.fromstring(response.text)
 
-    def _get(self, url: str, params: dict) -> requests.Response:
+        for article_elem in root.findall(".//PubmedArticle"):
+            # Prefer Version="1" to avoid duplicate PMID entries for erratum notices.
+            pmid_elem = article_elem.find(".//PMID[@Version='1']")
+            if pmid_elem is None:
+                pmid_elem = article_elem.find(".//PMID")
+            if pmid_elem is None or not (pmid_elem.text or "").strip():
+                continue
+            p = pmid_elem.text.strip()
+            record = self._parse_article(article_elem, p)
+            records[p] = record
+            self._record_cache[p] = record
+
+        logger.debug(
+            "fetch_records_batch(%d pmids) → %d cached, %d fetched",
+            len(unique),
+            len(unique) - len(to_fetch),
+            len(to_fetch),
+        )
+        return records
+
+    # ------------------------------------------------------------------
+    # Private helpers — NCBI HTTP layer
+    # ------------------------------------------------------------------
+
+    def _get(
+        self,
+        url: str,
+        params: dict[str, object] | list[tuple[str, str]],
+    ) -> requests.Response:
         """
         Issue a rate-limited GET request.
 
@@ -345,15 +358,35 @@ class PubMedClient:
         stated rate limits regardless of how quickly the caller invokes this
         method.
         """
-        elapsed   = time.monotonic() - self._last_call_ts
-        remaining = self._rate_limit_s - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
-
-        response          = self._session.get(url, params=params, timeout=PUBMED_REQUEST_TIMEOUT_S)
-        self._last_call_ts = time.monotonic()
-        response.raise_for_status()
-        return response
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
+            elapsed = time.monotonic() - self._last_call_ts
+            remaining = self._rate_limit_s - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+            try:
+                response = self._session.get(
+                    url, params=params, timeout=PUBMED_REQUEST_TIMEOUT_S
+                )
+                self._last_call_ts = time.monotonic()
+                if response.status_code in (429, 500, 502, 503, 504):
+                    raise requests.HTTPError(f"{response.status_code} from NCBI", response=response)
+                response.raise_for_status()
+                return response
+            except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
+                self._last_call_ts = time.monotonic()
+                last_exc = exc
+                if attempt < _MAX_RETRIES - 1:
+                    backoff = _RETRY_BACKOFF_S * (2**attempt)
+                    logger.warning(
+                        "NCBI request failed (attempt %d/%d), retrying in %.0fs: %s",
+                        attempt + 1,
+                        _MAX_RETRIES,
+                        backoff,
+                        exc,
+                    )
+                    time.sleep(backoff)
+        raise last_exc  # type: ignore[misc]
 
     # ------------------------------------------------------------------
     # Private helpers — XML parsing
@@ -367,32 +400,41 @@ class PubMedClient:
         and unstructured abstracts (a single ``AbstractText`` element with no
         label attribute).
         """
-        article = (
-            root.find(".//MedlineCitation/Article")
-            or root.find(".//Article")
-        )
+        article = root.find(".//MedlineCitation/Article")
+        if article is None:
+            article = root.find(".//Article")
         if article is None:
             logger.warning("fetch_record(%s): no <Article> element found in XML", pmid)
             return PubMedRecord(pmid=pmid, title="", abstract_text="")
 
-        title   = self._text(article.find("ArticleTitle"))
+        title = self._text(article.find("ArticleTitle"))
         authors = self._parse_authors(article)
         journal = self._parse_journal(root)
         pub_year = self._parse_pub_year(article, root)
+        pub_date = self._parse_pub_date(article)
         abstract_sections, abstract_text = self._parse_abstract(article)
+        results_text = self._section_text(abstract_sections, _RESULT_SECTION_LABELS)
+        conclusion_text = self._section_text(abstract_sections, _CONCLUSION_SECTION_LABELS)
         mesh_terms = self._parse_mesh(root)
-        pub_types  = self._parse_pub_types(article)
+        pub_types = self._parse_pub_types(article)
+        doi = self._parse_doi(root)
+        nct_ids = self._parse_nct_ids(root, title, abstract_text)
 
         return PubMedRecord(
-            pmid              = pmid,
-            title             = title,
-            abstract_text     = abstract_text,
-            abstract_sections = abstract_sections,
-            authors           = authors,
-            pub_year          = pub_year,
-            journal           = journal,
-            mesh_terms        = mesh_terms,
-            pub_types         = pub_types,
+            pmid=pmid,
+            title=title,
+            abstract_text=abstract_text,
+            abstract_sections=abstract_sections,
+            results_text=results_text,
+            conclusion_text=conclusion_text,
+            authors=authors,
+            pub_year=pub_year,
+            pub_date=pub_date,
+            journal=journal,
+            mesh_terms=mesh_terms,
+            pub_types=pub_types,
+            doi=doi,
+            nct_ids=nct_ids,
         )
 
     @staticmethod
@@ -424,16 +466,22 @@ class PubMedClient:
 
         for elem in abstract_elem.findall("AbstractText"):
             label = (elem.get("Label") or "").strip().upper()
-            text  = self._text(elem)
+            text = self._text(elem)
             if not text:
                 continue
             if label:
-                sections[label] = text
+                sections[label] = " ".join(part for part in (sections.get(label, ""), text) if part)
                 parts.append(f"{label}: {text}")
             else:
                 parts.append(text)
 
         return sections, "\n".join(parts)
+
+    @staticmethod
+    def _section_text(sections: dict[str, str], labels: tuple[str, ...]) -> str:
+        """Return labelled abstract text for the first matching section group."""
+        parts = [sections[label] for label in labels if sections.get(label)]
+        return "\n".join(parts)
 
     def _parse_authors(self, article: ET.Element) -> list[str]:
         """Return a list of author last names in publication order."""
@@ -474,6 +522,42 @@ class PubMedClient:
         article_date = article.find(".//ArticleDate/Year")
         return self._text(article_date) if article_date is not None else ""
 
+    def _parse_pub_date(self, article: ET.Element) -> str:
+        """Return an exact ISO publication date, or blank when incomplete."""
+        month_names = {
+            "jan": 1,
+            "feb": 2,
+            "mar": 3,
+            "apr": 4,
+            "may": 5,
+            "jun": 6,
+            "jul": 7,
+            "aug": 8,
+            "sep": 9,
+            "oct": 10,
+            "nov": 11,
+            "dec": 12,
+        }
+        for date_element in (
+            article.find(".//ArticleDate"),
+            article.find(".//Journal/JournalIssue/PubDate"),
+        ):
+            if date_element is None:
+                continue
+            year = self._text(date_element.find("Year"))
+            month = self._text(date_element.find("Month"))
+            day = self._text(date_element.find("Day"))
+            if not (year.isdigit() and day.isdigit() and month):
+                continue
+            month_number = int(month) if month.isdigit() else month_names.get(month[:3].lower())
+            if month_number is None:
+                continue
+            try:
+                return f"{int(year):04d}-{month_number:02d}-{int(day):02d}"
+            except ValueError:
+                continue
+        return ""
+
     def _parse_mesh(self, root: ET.Element) -> list[str]:
         """Return a list of MeSH descriptor names for this article."""
         terms: list[str] = []
@@ -510,3 +594,21 @@ class PubMedClient:
             if pt:
                 types.add(pt)
         return types
+
+    def _parse_doi(self, root: ET.Element) -> str:
+        """Return the DOI from PubMed article identifiers, when available."""
+        for element in root.findall(".//PubmedData/ArticleIdList/ArticleId"):
+            if (element.get("IdType") or "").lower() == "doi":
+                return self._text(element).lower()
+        return ""
+
+    def _parse_nct_ids(self, root: ET.Element, title: str, abstract: str) -> set[str]:
+        """Collect NCT identifiers from indexed IDs and citation text."""
+        text_parts = [title, abstract]
+        text_parts.extend(
+            self._text(element) for element in root.findall(".//DataBankList//AccessionNumber")
+        )
+        text_parts.extend(
+            self._text(element) for element in root.findall(".//MedlineCitation/OtherID")
+        )
+        return {value.upper() for value in re.findall(r"\bNCT\d{8}\b", " ".join(text_parts), re.I)}

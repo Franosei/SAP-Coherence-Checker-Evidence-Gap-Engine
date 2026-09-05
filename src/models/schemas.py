@@ -17,7 +17,10 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # Enumerations — match exactly the values documented in the proposal
 # ---------------------------------------------------------------------------
 
+
 class LinkageMethod(str, Enum):
+    PUBLICATION_FAMILY = "publication_family"
+    CTGOV_REFERENCE = "ctgov_reference"
     DIRECT = "direct"
     FUZZY = "fuzzy"
     AUTHOR_DATE = "author_date"
@@ -31,6 +34,66 @@ class LinkageConfidence(str, Enum):
     UNLINKED = "Unlinked"
 
 
+class PublicationRole(str, Enum):
+    PRIMARY_RESULTS = "primary_results"
+    INTERIM_RESULTS = "interim_results"
+    UPDATED_RESULTS = "updated_results"
+    FINAL_RESULTS = "final_results"
+    SECONDARY_ENDPOINT = "secondary_endpoint"
+    SUBGROUP_POSTHOC = "subgroup_posthoc"
+    SAFETY = "safety"
+    QOL_PRO = "qol_pro"
+    BIOMARKER_TRANSLATIONAL = "biomarker_translational"
+    LONG_TERM_FOLLOWUP = "long_term_followup"
+    EXTENSION_STUDY = "extension_study"
+    PROTOCOL_SAP = "protocol_sap"
+    OTHER = "other"
+    # Could not be classified because the per-trial LLM-arbiter budget was spent
+    # before this paper was reached. Distinct from OTHER (a real "none of the
+    # above" verdict); always carries human_review_required=True.
+    UNRESOLVED = "unresolved"
+
+
+class PrimaryResultStatus(str, Enum):
+    # Binary by design: the LLM linker either identifies the primary-results
+    # paper (SELECTED) or determines none of the candidates report it
+    # (NOT_FOUND). Low-confidence SELECTED picks carry human_review_required
+    # rather than a separate "ambiguous" status.
+    SELECTED = "SELECTED"
+    NOT_FOUND = "NOT_FOUND"
+
+
+class AnalysisStage(str, Enum):
+    """When in the trial's analysis timeline a publication sits.
+
+    Deliberately distinct from :class:`PublicationRole`. A single paper can be
+    ``publication_role=PRIMARY_RESULTS`` with ``analysis_stage=FINAL`` ("final
+    analysis of the primary endpoint"); role and stage answer different
+    questions and are derived independently.
+    """
+
+    INTERIM = "INTERIM"
+    PRIMARY = "PRIMARY"
+    UPDATED = "UPDATED"
+    FINAL = "FINAL"
+    LONG_TERM = "LONG_TERM"
+    UNSPECIFIED = "UNSPECIFIED"
+
+
+class TrialIdentityStatus(str, Enum):
+    """Hard gate for publication-family membership.
+
+    Publication role and trial identity are separate questions: a clean
+    "primary analysis" paper can still belong to a different trial. Only
+    ``CONFIRMED`` candidates are members; ``REJECTED`` candidates are retained
+    for audit but never enter role rollups or primary selection.
+    """
+
+    CONFIRMED = "confirmed"
+    UNCERTAIN = "uncertain"
+    REJECTED = "rejected"
+
+
 class EndpointRouting(str, Enum):
     AUTO_CONCORDANT = "auto_concordant"
     LLM = "llm"
@@ -38,15 +101,31 @@ class EndpointRouting(str, Enum):
 
 
 class SwitchType(str, Enum):
+    # No material change: same outcome, incl. pure terminology change or longer
+    # follow-up of the same endpoint.
     CONCORDANT = "concordant"
+    # A NEW/extra analysis is reported but the paper transparently labels it
+    # post-hoc / exploratory / unplanned. Not outcome switching.
+    ADDITIONAL_OUTCOME = "additional_outcome"
+    # Same underlying outcome, but its timeframe / definition / metric /
+    # threshold / analysis population changed ("outcome modification").
     MINOR_MODIFICATION = "minor_modification"
+    # A prespecified-outcome switch that is partially disclosed, or where it is
+    # unclear whether the change was influenced by the observed results.
     MODERATE_SWITCH = "moderate_switch"
+    # A prespecified primary replaced / demoted / omitted, or a secondary
+    # promoted — not transparently disclosed and plausibly results-driven.
     MAJOR_SWITCH = "major_switch"
 
 
 class SwitchDirection(str, Enum):
     NONE = "none"
     PROMOTION_OF_SECONDARY = "promotion_of_secondary"
+    PRIMARY_DEMOTED = "primary_demoted"
+    PRESPECIFIED_OMITTED = "prespecified_omitted"
+    UNREGISTERED_ADDED = "unregistered_added"
+    DEFINITION_CHANGED = "definition_changed"
+    ANALYSIS_POPULATION_CHANGED = "analysis_population_changed"
     COMPOSITE_MODIFIED = "composite_modified"
     TIMEFRAME_CHANGED = "timeframe_changed"
     ENDPOINT_REPLACED = "endpoint_replaced"
@@ -63,6 +142,15 @@ class HumanReviewStatus(str, Enum):
     YES = "yes"
     NO = "no"
     SPOT_CHECK = "spot_check"
+    # The LLM verdict was confident (confidence_score >= threshold, not flagged)
+    # and was accepted without individual human review. Still auditable and
+    # still subject to the random spot-check sample.
+    AUTO_ACCEPTED = "auto_accepted"
+
+
+# Review states that count as "resolved" — no longer in the human queue,
+# and their human_final_class / human_poolable are used downstream.
+RESOLVED_REVIEW_STATES = ("yes", "spot_check", "auto_accepted")
 
 
 class HumanDecision(str, Enum):
@@ -83,6 +171,7 @@ class EvidenceStrength(str, Enum):
 # Module 1 — Linkage audit log entry (Section 3.2.2)
 # ---------------------------------------------------------------------------
 
+
 class LinkageAuditEntry(BaseModel):
     nct_id: str = Field(..., description="ClinicalTrials.gov NCT identifier")
     pmid: Optional[str] = Field(None, description="PubMed identifier; NULL if unlinked")
@@ -90,8 +179,8 @@ class LinkageAuditEntry(BaseModel):
     linkage_confidence: LinkageConfidence
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     linked_by: str = Field(
-        default="pipeline_v3.0",
-        description="'pipeline_v3.0' or 'reviewer:<initials>' if manually resolved",
+        default="pipeline_v4.0",
+        description="'pipeline_v4.0' or 'reviewer:<initials>' if manually resolved",
     )
     notes: Optional[str] = Field(None, description="Free text — e.g. resolution rationale")
 
@@ -104,9 +193,76 @@ class LinkageAuditEntry(BaseModel):
         return v
 
 
+class PublicationFamilyEntry(BaseModel):
+    """One candidate publication and its independently assessed trial role."""
+
+    nct_id: str
+    pmid: str
+    doi: str = ""
+    title: str = ""
+    year: str = ""
+    discovery_sources: list[str] = Field(default_factory=list)
+    registry_reference_type: Optional[str] = None
+    registry_result_reference: bool = False
+    same_trial: Optional[bool] = None
+    trial_identity_status: TrialIdentityStatus = TrialIdentityStatus.UNCERTAIN
+    trial_match_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    trial_match_evidence: list[str] = Field(default_factory=list)
+    publication_role: PublicationRole = PublicationRole.OTHER
+    analysis_stage: AnalysisStage = AnalysisStage.UNSPECIFIED
+    analysis_stage_raw: str = ""
+    population_scope: str = "unknown"
+    randomized_n: Optional[int] = None
+    analyzed_n: Optional[int] = None
+    arms: list[str] = Field(default_factory=list)
+    interventions: list[str] = Field(default_factory=list)
+    data_cutoff: str = ""
+    followup_duration: str = ""
+    explicit_primary: bool = False
+    explicit_interim: bool = False
+    explicit_final: bool = False
+    explicit_updated: bool = False
+    is_interim: bool = False
+    nct_in_article: bool = False
+    # PubMed publication-type screen: "results_candidate" | "excluded" | "neutral".
+    # "excluded" (protocol, meta-analysis, editorial, ...) never reaches the LLM.
+    pubtype_screen: str = "neutral"
+    reports_randomized_arms: bool = False
+    reports_outcome_data: bool = False
+    # True on the single candidate the LLM names as the trial's primary-results paper.
+    is_primary_results_pick: bool = False
+    classification_confidence: str = "low"
+    classification_reason: str = ""
+    human_review_required: bool = True
+
+
 # ---------------------------------------------------------------------------
 # Module 2 — LLM structured output (Section 3.3.2)
 # ---------------------------------------------------------------------------
+
+
+class EndpointComparison(BaseModel):
+    """One registered primary endpoint compared with its published counterpart.
+
+    Attribute fields are tri-state: ``True`` means affirmatively the same,
+    ``False`` means affirmatively different, and ``None`` means not stated or
+    unclear. This prevents missing abstract detail being treated as a change.
+    """
+
+    registered_endpoint: str
+    published_corresponding_endpoint: str = ""
+    same_construct: Optional[bool] = None
+    same_timeframe: Optional[bool] = None
+    same_definition: Optional[bool] = None
+    same_population: Optional[bool] = None
+    same_measurement_method: Optional[bool] = None
+    registered_endpoint_reported: Optional[bool] = None
+    additional_endpoint_present: bool = False
+    additional_endpoint_disclosed: bool = False
+    change_disclosed: Optional[bool] = None
+    actual_change_evidence: list[str] = Field(default_factory=list)
+    classification_label: str = ""
+
 
 class LLMEndpointClassification(BaseModel):
     """
@@ -116,6 +272,9 @@ class LLMEndpointClassification(BaseModel):
     """
 
     switch_type: SwitchType
+    classification_label: str = ""
+    primary_endpoint_match: str = "unclear"
+    published_primary_extracted: str = ""
     direction: SwitchDirection
     step_by_step_reasoning: str = Field(
         ...,
@@ -123,17 +282,51 @@ class LLMEndpointClassification(BaseModel):
         description="Mandatory — LLM must show its working",
     )
     confidence: LLMConfidence
+    confidence_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Numeric confidence 0-1; pairs at/above the review threshold skip human review. "
+        "0.0 means the model did not return one — derived from the categorical confidence.",
+    )
     comparability_for_pooling: bool
     flag_for_human_review: bool
     key_differences: list[str] = Field(
         default_factory=list,
         description="Specific textual differences identified by the LLM",
     )
+    disclosed_as_exploratory: bool = Field(
+        default=False,
+        description="Paper transparently labels the new/changed analysis as post-hoc / exploratory / unplanned",
+    )
+    likely_results_driven: bool = Field(
+        default=False,
+        description="The change plausibly favours a more positive or significant finding",
+    )
+    switch_forms: list[str] = Field(
+        default_factory=list,
+        description="Which typical outcome-switching forms apply (primary_replaced, primary_demoted, "
+        "secondary_promoted, prespecified_omitted, unregistered_added, timepoint_changed, "
+        "definition_changed, scale_threshold_changed, analysis_population_changed)",
+    )
+    actual_change_evidence: list[str] = Field(default_factory=list)
+    missing_detail_only: bool = False
+    adjudication_guardrail: str = ""
+    endpoint_comparisons: list[EndpointComparison] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _fill_confidence_score(self) -> LLMEndpointClassification:
+        if self.confidence_score == 0.0:
+            self.confidence_score = {"high": 0.9, "medium": 0.65, "low": 0.35}.get(
+                self.confidence.value, 0.35
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
 # Module 2 — Full decision log entry (Section 3.3.4)
 # ---------------------------------------------------------------------------
+
 
 class DecisionLogEntry(BaseModel):
     pair_id: str = Field(..., description="Unique (nct_id, pmid) pair identifier")
@@ -152,6 +345,17 @@ class DecisionLogEntry(BaseModel):
     llm_confidence: Optional[LLMConfidence] = None
     llm_comparability: Optional[bool] = None
     llm_flag: Optional[bool] = None
+    llm_disclosed_exploratory: Optional[bool] = None
+    llm_results_driven: Optional[bool] = None
+    llm_switch_forms: Optional[str] = None
+    llm_confidence_score: Optional[float] = None
+    llm_classification_label: Optional[str] = None
+    llm_primary_endpoint_match: Optional[str] = None
+    llm_published_primary_extracted: Optional[str] = None
+    llm_actual_change_evidence: Optional[str] = None
+    llm_missing_detail_only: Optional[bool] = None
+    llm_adjudication_guardrail: Optional[str] = None
+    llm_endpoint_comparisons: Optional[str] = None
 
     # Breast cancer population context (populated by Module 1 classifier)
     bc_subtype: Optional[str] = Field(
@@ -182,9 +386,7 @@ class DecisionLogEntry(BaseModel):
     def ssi_consistency(self) -> DecisionLogEntry:
         expected_ssi = round((1.0 - self.similarity_score) * 100, 4)
         if abs(self.ssi - expected_ssi) > 0.01:
-            raise ValueError(
-                f"SSI inconsistency: expected {expected_ssi}, got {self.ssi}"
-            )
+            raise ValueError(f"SSI inconsistency: expected {expected_ssi}, got {self.ssi}")
         return self
 
     @classmethod
@@ -209,6 +411,7 @@ class DecisionLogEntry(BaseModel):
 # ---------------------------------------------------------------------------
 # Module 3 — Effect measure for a single trial (Section 3.4.2)
 # ---------------------------------------------------------------------------
+
 
 class EffectMeasure(BaseModel):
     pair_id: str
@@ -235,23 +438,15 @@ class EffectMeasure(BaseModel):
         import math
 
         expected_log_hr = round(math.log(self.hr), 6)
-        expected_se = round(
-            (math.log(self.hr_uci) - math.log(self.hr_lci)) / (2 * 1.96), 6
-        )
+        expected_se = round((math.log(self.hr_uci) - math.log(self.hr_lci)) / (2 * 1.96), 6)
         expected_var = round(expected_se**2, 8)
 
         if abs(self.log_hr - expected_log_hr) > 0.001:
-            raise ValueError(
-                f"log_hr mismatch: expected {expected_log_hr}, got {self.log_hr}"
-            )
+            raise ValueError(f"log_hr mismatch: expected {expected_log_hr}, got {self.log_hr}")
         if abs(self.se_log_hr - expected_se) > 0.001:
-            raise ValueError(
-                f"SE(log HR) mismatch: expected {expected_se}, got {self.se_log_hr}"
-            )
+            raise ValueError(f"SE(log HR) mismatch: expected {expected_se}, got {self.se_log_hr}")
         if abs(self.variance - expected_var) > 0.0001:
-            raise ValueError(
-                f"Variance mismatch: expected {expected_var}, got {self.variance}"
-            )
+            raise ValueError(f"Variance mismatch: expected {expected_var}, got {self.variance}")
         return self
 
     @classmethod
@@ -308,6 +503,7 @@ class EffectMeasure(BaseModel):
 # Module 4 — Power audit entry (Section 3.5)
 # ---------------------------------------------------------------------------
 
+
 class PowerAuditEntry(BaseModel):
     nct_id: str
     enrollment: int = Field(..., gt=0)
@@ -325,13 +521,15 @@ class PowerAuditEntry(BaseModel):
         None, description="If excluded from power audit, reason code"
     )
     inputs_source: str = Field(
-        ..., description="How enrollment/event-rate were obtained: 'registry' | 'abstract' | 'manual'"
+        ...,
+        description="How enrollment/event-rate were obtained: 'registry' | 'abstract' | 'manual'",
     )
 
 
 # ---------------------------------------------------------------------------
 # Evidence gap scorecard entry (Section 3.6)
 # ---------------------------------------------------------------------------
+
 
 class ScorecardEntry(BaseModel):
     endpoint_cluster: str

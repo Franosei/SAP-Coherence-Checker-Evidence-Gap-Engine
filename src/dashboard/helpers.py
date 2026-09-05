@@ -11,7 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from shiny import ui
 
-from src.pipeline.validation import select_spot_check_pairs
+from src.pipeline.validation import pairs_needing_human_review, select_spot_check_pairs
 
 ROUTING_LABELS = {
     "auto_concordant": "Auto concordant",
@@ -20,10 +20,11 @@ ROUTING_LABELS = {
 }
 
 SWITCH_LABELS = {
-    "concordant": "Concordant",
-    "minor_modification": "Minor modification",
-    "moderate_switch": "Moderate switch",
-    "major_switch": "Major switch",
+    "concordant": "Concordant (no change)",
+    "additional_outcome": "Additional outcome (disclosed exploratory)",
+    "minor_modification": "Outcome modification (timeframe/definition/population)",
+    "moderate_switch": "Outcome switch — moderate / partly disclosed",
+    "major_switch": "Outcome switch — major / undisclosed",
 }
 
 
@@ -111,22 +112,25 @@ def page_header(title: str, subtitle: str = "") -> ui.Tag:
 
 
 def pending_review_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """Pairs still awaiting a human decision, least-confident first.
+
+    The queue is: every outcome-switch verdict + every flagged / low-confidence /
+    missing-endpoint pair + the spot-check sample of the auto-accepted verdicts,
+    minus anything a human has already resolved (see
+    ``validation.pairs_needing_human_review``).
+    """
     if frame.empty:
         return frame.copy()
-    spot_check_pairs = select_spot_check_pairs(frame)
-    needs_review = (
-        frame["routing"].eq("llm")
-        | frame["llm_confidence"].eq("low")
-        | frame["llm_flag"].map(truthy)
-        | frame["published_endpoint"].eq("")
-        | frame["pair_id"].isin(spot_check_pairs)
-    )
-    unresolved = ~frame["human_reviewed"].isin(["yes", "spot_check"])
-    queue = frame[needs_review & unresolved].copy()
-    queue["similarity_score_numeric"] = pd.to_numeric(queue["similarity_score"], errors="coerce")
-    return queue.sort_values(["similarity_score_numeric", "pair_id"], na_position="last").drop(
-        columns=["similarity_score_numeric"]
-    )
+    need = pairs_needing_human_review(frame)
+    queue = frame[frame["pair_id"].isin(need)].copy()
+    if queue.empty:
+        return queue
+    queue["_conf"] = pd.to_numeric(queue.get("llm_confidence_score"), errors="coerce")
+    queue["_is_switch"] = queue["llm_switch_type"].isin(["moderate_switch", "major_switch"])
+    # Switches first, then lowest confidence first.
+    return queue.sort_values(
+        ["_is_switch", "_conf", "pair_id"], ascending=[False, True, True], na_position="first"
+    ).drop(columns=["_conf", "_is_switch"])
 
 
 def is_spot_check_row(row: pd.Series, frame: pd.DataFrame) -> bool:
@@ -139,7 +143,7 @@ def default_switch(row: pd.Series) -> str:
         return str(row["human_final_class"])
     if safe_text(row.get("llm_switch_type"), ""):
         return str(row["llm_switch_type"])
-    return "concordant" if row.get("routing") == "auto_concordant" else "major_switch"
+    return "concordant"
 
 
 def default_poolable(row: pd.Series) -> bool:

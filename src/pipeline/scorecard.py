@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 # Evidence strength classification rules
 # ---------------------------------------------------------------------------
 
+
 def _classify_evidence_strength(
     pooled_hr: Optional[float],
     cri_lower: Optional[float],
@@ -55,6 +56,7 @@ def _classify_evidence_strength(
 # AI calibration metrics
 # ---------------------------------------------------------------------------
 
+
 def compute_ai_calibration(
     decision_log: pd.DataFrame,
     gold_standard: pd.DataFrame,
@@ -82,73 +84,91 @@ def compute_ai_calibration(
 #   5. objective_response_rate — ORR/CBR/CR+PR
 #   6. patient_reported_outcomes — QoL/PRO/symptom burden
 _CLUSTER_RULES: list[tuple[str, list[str]]] = [
-    ("pathological_complete_response", [
-        r"pathologic(?:al)?\s+complete\s+response",
-        r"\bpcr\b",
-        r"ypt0",
-        r"ypn0",
-        r"residual\s+cancer\s+burden",
-        r"\brcb\b",
-        r"ypT0/is",
-        r"no\s+residual\s+invasive\s+disease",
-        r"complete\s+pathologic\s+response",
-    ]),
-    ("event_free_disease_free_survival", [
-        r"\befs\b",
-        r"event[- ]free\s+survival",
-        r"\bdfs\b",
-        r"disease[- ]free\s+survival",
-        r"\bidfs\b",
-        r"invasive\s+disease[- ]free\s+survival",
-        r"\birfs\b",
-        r"\brfs\b",
-        r"relapse[- ]free\s+survival",
-        r"recurrence[- ]free\s+survival",
-        r"distant\s+disease[- ]free\s+survival",
-    ]),
-    ("overall_survival", [
-        r"\bos\b",
-        r"overall\s+survival",
-        r"all[- ]cause\s+mort",
-        r"all[- ]cause\s+death",
-        r"death\s+from\s+any\s+cause",
-        r"death\s+due\s+to\s+any\s+cause",
-        r"survival\s+time",
-    ]),
-    ("progression_free_survival", [
-        r"\bpfs\b",
-        r"progression[- ]free\s+survival",
-        r"\bttp\b",
-        r"time\s+to\s+progression",
-        r"\bpfs2\b",
-        r"second\s+progression[- ]free\s+survival",
-        r"time\s+to\s+disease\s+progression",
-        r"time\s+to\s+treatment\s+failure",
-    ]),
-    ("objective_response_rate", [
-        r"\borr\b",
-        r"objective\s+response\s+rate",
-        r"\bcbr\b",
-        r"clinical\s+benefit\s+rate",
-        r"complete\s+response.*partial\s+response",
-        r"cr\s*\+\s*pr",
-        r"overall\s+response\s+rate",
-        r"confirmed\s+response",
-        r"best\s+overall\s+response",
-    ]),
-    ("patient_reported_outcomes", [
-        r"quality\s+of\s+life",
-        r"\bqol\b",
-        r"\bpro\b",
-        r"patient[- ]reported",
-        r"symptom\s+burden",
-        r"\beortc\b",
-        r"qlq[- ]",
-        r"\bfact[- ]",
-        r"functional\s+assessment",
-        r"pain\s+score",
-        r"fatigue\s+scale",
-    ]),
+    (
+        "pathological_complete_response",
+        [
+            r"pathologic(?:al)?\s+complete\s+response",
+            r"\bpcr\b",
+            r"ypt0",
+            r"ypn0",
+            r"residual\s+cancer\s+burden",
+            r"\brcb\b",
+            r"ypT0/is",
+            r"no\s+residual\s+invasive\s+disease",
+            r"complete\s+pathologic\s+response",
+        ],
+    ),
+    (
+        "event_free_disease_free_survival",
+        [
+            r"\befs\b",
+            r"event[- ]free\s+survival",
+            r"\bdfs\b",
+            r"disease[- ]free\s+survival",
+            r"\bidfs\b",
+            r"invasive\s+disease[- ]free\s+survival",
+            r"\birfs\b",
+            r"\brfs\b",
+            r"relapse[- ]free\s+survival",
+            r"recurrence[- ]free\s+survival",
+            r"distant\s+disease[- ]free\s+survival",
+        ],
+    ),
+    (
+        "overall_survival",
+        [
+            r"\bos\b",
+            r"overall\s+survival",
+            r"all[- ]cause\s+mort",
+            r"all[- ]cause\s+death",
+            r"death\s+from\s+any\s+cause",
+            r"death\s+due\s+to\s+any\s+cause",
+            r"survival\s+time",
+        ],
+    ),
+    (
+        "progression_free_survival",
+        [
+            r"\bpfs\b",
+            r"progression[- ]free\s+survival",
+            r"\bttp\b",
+            r"time\s+to\s+progression",
+            r"\bpfs2\b",
+            r"second\s+progression[- ]free\s+survival",
+            r"time\s+to\s+disease\s+progression",
+            r"time\s+to\s+treatment\s+failure",
+        ],
+    ),
+    (
+        "objective_response_rate",
+        [
+            r"\borr\b",
+            r"objective\s+response\s+rate",
+            r"\bcbr\b",
+            r"clinical\s+benefit\s+rate",
+            r"complete\s+response.*partial\s+response",
+            r"cr\s*\+\s*pr",
+            r"overall\s+response\s+rate",
+            r"confirmed\s+response",
+            r"best\s+overall\s+response",
+        ],
+    ),
+    (
+        "patient_reported_outcomes",
+        [
+            r"quality\s+of\s+life",
+            r"\bqol\b",
+            r"\bpro\b",
+            r"patient[- ]reported",
+            r"symptom\s+burden",
+            r"\beortc\b",
+            r"qlq[- ]",
+            r"\bfact[- ]",
+            r"functional\s+assessment",
+            r"pain\s+score",
+            r"fatigue\s+scale",
+        ],
+    ),
 ]
 
 
@@ -195,7 +215,7 @@ def cluster_endpoints(
 
     for _, row in matched_df.iterrows():
         pair_id = str(row.get(pair_id_col, "")).strip()
-        text    = str(row.get(registered_col, "")).strip().lower()
+        text = str(row.get(registered_col, "")).strip().lower()
 
         if not text or text in {"", "none", "nan"}:
             clusters["missing_endpoint"].append(pair_id)
@@ -232,8 +252,102 @@ def cluster_endpoints(
 # Per-cluster scorecard construction
 # ---------------------------------------------------------------------------
 
+
+_SWITCH_CLASSES = ("moderate_switch", "major_switch")
+_HUMAN_REVIEWED = ("yes", "spot_check")
+
+
+def _final_class(row: pd.Series) -> str:
+    """The class of record for a pair: the human verdict if one exists, else the LLM's."""
+    human = str(row.get("human_final_class", "")).strip()
+    if human:
+        return human
+    return str(row.get("llm_switch_type", "")).strip()
+
+
+def _summary_row(scope: str, frame: pd.DataFrame) -> dict:
+    n_pairs = len(frame)
+    assessable = frame[frame["published_endpoint"].astype(str).str.strip() != ""]
+    n_assessable = len(assessable)
+
+    final = frame.apply(_final_class, axis=1)
+    is_switch = final.isin(_SWITCH_CLASSES)
+    n_switch = int(is_switch.sum())
+
+    reviewed_mask = frame["human_reviewed"].astype(str).isin(_HUMAN_REVIEWED)
+    human_switch = frame["human_final_class"].astype(str).isin(_SWITCH_CLASSES) & reviewed_mask
+    n_human_confirmed = int(human_switch.sum())
+    ai_switch = frame["llm_switch_type"].astype(str).isin(_SWITCH_CLASSES)
+    n_ai_only = int((ai_switch & ~reviewed_mask).sum())
+
+    results_driven = frame["llm_results_driven"].astype(str).str.lower().isin({"true", "1", "yes"})
+    disclosed = (
+        frame["llm_disclosed_exploratory"].astype(str).str.lower().isin({"true", "1", "yes"})
+    )
+
+    # AI-human agreement over pairs a human actually reviewed.
+    human_only = frame[reviewed_mask & (frame["llm_switch_type"].astype(str).str.strip() != "")]
+    agreed = human_only[human_only["llm_switch_type"] == human_only["human_final_class"]]
+    agreement = round(len(agreed) / len(human_only) * 100, 1) if len(human_only) else None
+
+    denom = n_assessable or n_pairs
+    return {
+        "scope": scope,
+        "n_pairs": n_pairs,
+        "n_assessable": n_assessable,
+        "n_outcome_switch": n_switch,
+        "switch_rate_pct": round(n_switch / denom * 100, 1) if denom else 0.0,
+        "n_human_confirmed_switch": n_human_confirmed,
+        "n_ai_only_switch_pending_review": n_ai_only,
+        "n_results_driven": int((is_switch & results_driven).sum()),
+        "results_driven_fraction_of_switches": (
+            round(int((is_switch & results_driven).sum()) / n_switch, 3) if n_switch else None
+        ),
+        "n_disclosed_exploratory": int(disclosed.sum()),
+        "ai_human_agreement_pct": agreement,
+    }
+
+
+def build_switching_summary(
+    endpoint_clusters: dict[str, list[str]],
+    decision_log_path=DECISION_LOG_PATH,
+) -> pd.DataFrame:
+    """Characterise the outcome switching found across the corpus.
+
+    One row for the overall corpus, one per endpoint cluster, and one per
+    switch *form* (timeframe change, secondary promotion, ...). "Switch" counts
+    only ``moderate_switch`` + ``major_switch``; ``minor_modification`` (outcome
+    modification) and ``additional_outcome`` (disclosed exploratory add-on) are
+    not switches. See ``_summary_row`` for the per-scope metrics.
+    """
+    dl = pd.read_csv(decision_log_path, dtype=str, keep_default_na=False)
+    if dl.empty:
+        return pd.DataFrame()
+
+    rows: list[dict] = [_summary_row("overall", dl)]
+
+    for cluster_name, pair_ids in endpoint_clusters.items():
+        sub = dl[dl["pair_id"].isin(pair_ids)]
+        if not sub.empty:
+            rows.append(_summary_row(f"cluster:{cluster_name}", sub))
+
+    # Per-form breakdown — a pair can carry several " | "-joined forms.
+    form_map: dict[str, list[str]] = {}
+    for _, row in dl.iterrows():
+        forms = str(row.get("llm_switch_forms", "")).strip()
+        if not forms:
+            continue
+        for form in (f.strip() for f in forms.split("|")):
+            if form:
+                form_map.setdefault(form, []).append(str(row["pair_id"]))
+    for form, ids in sorted(form_map.items()):
+        rows.append(_summary_row(f"form:{form}", dl[dl["pair_id"].isin(ids)]))
+
+    return pd.DataFrame(rows)
+
+
 def build_scorecard(
-    endpoint_clusters: dict[str, list[str]],   # cluster_name → [pair_ids]
+    endpoint_clusters: dict[str, list[str]],  # cluster_name → [pair_ids]
     decision_log_path=DECISION_LOG_PATH,
     linkage_log_path=LINKAGE_LOG_PATH,
     bayesian_summaries: Optional[dict[str, dict]] = None,
@@ -269,8 +383,7 @@ def build_scorecard(
         # Unlinked: from linkage log
         nct_ids_in_cluster = cluster_dl["pair_id"].str.split("_").str[0].unique().tolist()
         trials_unlinked = ll[
-            ll["nct_id"].isin(nct_ids_in_cluster)
-            & ll["linkage_confidence"].isin(["Unlinked"])
+            ll["nct_id"].isin(nct_ids_in_cluster) & ll["linkage_confidence"].isin(["Unlinked"])
         ].shape[0]
 
         # Human override rate
@@ -284,24 +397,19 @@ def build_scorecard(
         ssi_vals = pd.to_numeric(cluster_dl["ssi"], errors="coerce").dropna()
         mean_ssi = round(float(ssi_vals.mean()), 2) if not ssi_vals.empty else 0.0
 
-        # Human-confirmed switch rate
+        # Human-confirmed OUTCOME-SWITCH rate. "minor_modification" (outcome
+        # modification) and "additional_outcome" (disclosed exploratory add-on)
+        # are not counted as switches.
         confirmed_switch = cluster_dl[
-            cluster_dl["human_final_class"].isin(
-                ["minor_modification", "moderate_switch", "major_switch"]
-            )
+            cluster_dl["human_final_class"].isin(["moderate_switch", "major_switch"])
         ]
-        switch_rate = round(
-            len(confirmed_switch) / max(len(cluster_dl), 1) * 100, 1
-        )
+        switch_rate = round(len(confirmed_switch) / max(len(cluster_dl), 1) * 100, 1)
 
-        # AI-human agreement
-        agreed = cluster_dl[
-            cluster_dl["llm_switch_type"].notna()
-            & (cluster_dl["llm_switch_type"] == cluster_dl["human_final_class"])
-        ]
-        ai_human_agreement = round(
-            len(agreed) / max(cluster_dl["llm_switch_type"].notna().sum(), 1) * 100, 1
-        )
+        # AI-human agreement — genuine calibration, so only over pairs a HUMAN
+        # actually reviewed (auto-accepted pairs agree by construction).
+        human_only = reviewed[reviewed["llm_switch_type"].astype(str).str.strip() != ""]
+        agreed = human_only[human_only["llm_switch_type"] == human_only["human_final_class"]]
+        ai_human_agreement = round(len(agreed) / max(len(human_only), 1) * 100, 1)
 
         # Bayesian results
         bayes = (bayesian_summaries or {}).get(cluster_name, {})
@@ -317,16 +425,12 @@ def build_scorecard(
         i_squared: Optional[float] = None
         if tau is not None and within_trial_variances:
             cluster_vars = [
-                within_trial_variances[pid]
-                for pid in pair_ids
-                if pid in within_trial_variances
+                within_trial_variances[pid] for pid in pair_ids if pid in within_trial_variances
             ]
             if cluster_vars:
                 sigma2_typical = float(np.median(cluster_vars))
                 if sigma2_typical > 0:
-                    i_squared = round(
-                        tau ** 2 / (tau ** 2 + sigma2_typical) * 100, 1
-                    )
+                    i_squared = round(tau**2 / (tau**2 + sigma2_typical) * 100, 1)
 
         # Mean optimism bias from power audit
         if power_audit_summary:

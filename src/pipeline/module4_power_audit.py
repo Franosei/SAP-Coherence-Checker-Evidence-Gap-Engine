@@ -15,7 +15,7 @@ from __future__ import annotations
 import csv
 import logging
 import math
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Optional
 
 import pandas as pd
@@ -44,6 +44,7 @@ _COLUMNS = [
 # Effect size back-calculation
 # ---------------------------------------------------------------------------
 
+
 def _back_calculate_hr(
     enrollment: int,
     event_rate: float,
@@ -70,18 +71,20 @@ def _back_calculate_hr(
     # (z_alpha + z_beta)^2 = n_events * (log HR)^2 / 4
     # |log HR| = (z_alpha + z_beta) * 2 / sqrt(n_events)
     log_hr_abs = (z_alpha + z_beta) * 2.0 / math.sqrt(n_events)
-    implied_hr = math.exp(-log_hr_abs)   # beneficial direction (HR < 1)
+    implied_hr = math.exp(-log_hr_abs)  # beneficial direction (HR < 1)
     return round(implied_hr, 4)
 
 
 def stats_norm_ppf(p: float) -> float:
     from scipy.stats import norm  # type: ignore
+
     return float(norm.ppf(p))
 
 
 # ---------------------------------------------------------------------------
 # Posterior HR at registration date
 # ---------------------------------------------------------------------------
+
 
 def get_posterior_hr_at_date(
     registration_date: str,
@@ -122,6 +125,7 @@ def get_posterior_hr_at_date(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def run_power_audit(
     trials_df: pd.DataFrame,
@@ -196,7 +200,7 @@ def run_power_audit(
         rows_for_log.append(
             {
                 **entry.model_dump(),
-                "audit_timestamp": datetime.utcnow().isoformat(),
+                "audit_timestamp": datetime.now(UTC).isoformat(),
             }
         )
 
@@ -222,11 +226,15 @@ def run_power_audit(
 
 
 def _write_power_audit_log(rows: list[dict]) -> None:
+    """Rewrite the whole audit log — one row per nct_id, latest run wins. Never appended."""
     POWER_AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not POWER_AUDIT_LOG_PATH.exists()
-    with open(POWER_AUDIT_LOG_PATH, "a", newline="", encoding="utf-8") as f:
+    by_nct: dict[str, dict] = {}
+    for row in rows:
+        nct = str(row.get("nct_id", "")).strip()
+        if nct:
+            by_nct[nct] = row
+    with open(POWER_AUDIT_LOG_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=_COLUMNS)
-        if write_header:
-            writer.writeheader()
-        for row in rows:
+        writer.writeheader()
+        for row in by_nct.values():
             writer.writerow({col: row.get(col, "") for col in _COLUMNS})
