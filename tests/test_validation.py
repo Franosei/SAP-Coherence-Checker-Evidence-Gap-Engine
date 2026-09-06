@@ -106,18 +106,30 @@ def test_templates_are_blinded_and_include_expected_columns() -> None:
     assert len(inter_rater_template) >= 1
 
 
-def test_select_spot_check_pairs_samples_only_auto_accepted_rows() -> None:
+def test_select_spot_check_pairs_pool_is_frozen_and_ignores_review_status() -> None:
+    """The sample is drawn from the immutable 'was confident enough to accept'
+    columns, NOT from the mutable human_reviewed status — otherwise the pool
+    shrinks as pairs get reviewed and fresh pairs slide into the queue."""
+    base = {
+        "llm_switch_type": "concordant",
+        "registered_endpoint": "Overall survival",
+        "published_endpoint": "Overall survival at 24 months",
+        "llm_confidence_score": "0.95",
+    }
     decision_log = pd.DataFrame(
         [
-            {"pair_id": "NCT001_111", "human_reviewed": "auto_accepted"},
-            {"pair_id": "NCT002_222", "human_reviewed": "yes"},
-            {"pair_id": "NCT003_333", "human_reviewed": "auto_accepted"},
-            {"pair_id": "NCT004_444", "human_reviewed": "no"},
+            {"pair_id": "NCT001_111", "human_reviewed": "auto_accepted", **base},
+            # already reviewed — must STILL be in the pool so the window can't slide
+            {"pair_id": "NCT002_222", "human_reviewed": "spot_check", **base},
+            # low confidence — never in the accepted pool
+            {"pair_id": "NCT003_333", "human_reviewed": "no", **base, "llm_confidence_score": "0.30"},
+            # no verdict — never in the pool
+            {"pair_id": "NCT004_444", "human_reviewed": "no", **base, "llm_switch_type": ""},
         ]
     )
     pair_ids = select_spot_check_pairs(decision_log, rate=1.0)
 
-    assert pair_ids == {"NCT001_111", "NCT003_333"}
+    assert pair_ids == {"NCT001_111", "NCT002_222"}
 
 
 def test_pairs_needing_human_review_tolerates_missing_columns() -> None:

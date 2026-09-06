@@ -164,17 +164,33 @@ trigger modification. The overall label is the most severe supported
 endpoint-level result, while the full per-endpoint breakdown remains in the
 decision log and review dashboard.
 
-**Human-in-the-loop (v4.5).** Model classifications are suggestions, not final
-review decisions. Automatic acceptance is disabled by default, and every model
-verdict enters the human review queue. Existing human decisions remain final
-and override the model in all downstream metrics. `ENDPOINT_AUTO_ACCEPT=true`
-is an explicit post-validation opt-in; even when enabled, outcome switches are
-never automatically accepted.
+**Human-in-the-loop (simplified, Sept 2026).** The task is simple: does the
+publication report the registered primary endpoint? A pair is routed to a
+human ONLY when the model's numeric `confidence_score` is below
+`ENDPOINT_REVIEW_CONFIDENCE_THRESHOLD` (0.5) — or there is no verdict at all
+(a malformed/failed response) — or the comparison couldn't be made
+(no publication text, or no registered primary endpoint on the trial side).
+A verdict at or above the threshold is accepted directly
+(`human_reviewed = "auto_accepted"`) **regardless of switch severity** (a
+confident `major_switch` is accepted like a confident `concordant`) **and
+regardless of the model's advisory `flag_for_human_review` boolean** — a
+confident model that also ticks "you might want to look at this" is still
+trusted. Deterministic guardrails already fold their residual uncertainty
+into `confidence_score` (capped at 0.65), so a genuinely borderline guardrail
+case still falls below a threshold set above 0.65.
+`ENDPOINT_AUTO_ACCEPT` defaults to `true`; set it to `false` to send every
+verdict to review during a recalibration.
 
-The review queue (`validation.pairs_needing_human_review`) therefore contains
-every model-classified pair except those a human has already resolved. Decisions are written to
-`data/logs/decision_log.csv`; the human verdict (`human_final_class`) overrides
-the LLM's for every downstream metric.
+A deterministic `SPOT_CHECK_RATE` (default 15%) sample of the auto-accepted
+verdicts is still drawn into the queue so an AI-human agreement rate can be
+reported even though those pairs weren't individually necessary to review.
+Existing human decisions remain final and override the model in every
+downstream metric. The review queue (`validation.pairs_needing_human_review`)
+is: not-confident/no-verdict pairs + missing-publication-text pairs +
+missing-registered-endpoint pairs + the spot-check sample, minus anything a
+human has already resolved. Decisions are written to
+`data/logs/decision_log.csv`; the human verdict (`human_final_class`)
+overrides the LLM's for every downstream metric.
 
 Switch directions:
 

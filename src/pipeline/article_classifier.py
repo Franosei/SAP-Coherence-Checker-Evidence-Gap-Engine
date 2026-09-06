@@ -519,7 +519,7 @@ def _call_llm_arbiter(record: PubMedRecord) -> Optional[ArticleClassification]:
         LLM call failed or returned a malformed response.  ``None`` causes
         the caller to fall back to UNCERTAIN + flag_for_review=True.
     """
-    from src.pipeline.config import LLM_BASE_URL, LLM_MODEL_PRIMARY
+    from src.pipeline.config import LLM_BASE_URL, LLM_MODEL_PRIMARY, llm_sampling_kwargs
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
@@ -547,9 +547,8 @@ def _call_llm_arbiter(record: PubMedRecord) -> Optional[ArticleClassification]:
     try:
         response = client.chat.completions.create(
             model=LLM_MODEL_PRIMARY,
-            max_tokens=512,
-            temperature=0.0,
             response_format={"type": "json_object"},
+            **llm_sampling_kwargs(1500),
             messages=[
                 {"role": "system", "content": _LLM_SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},

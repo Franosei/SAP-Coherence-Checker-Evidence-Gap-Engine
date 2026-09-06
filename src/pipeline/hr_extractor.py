@@ -56,6 +56,7 @@ from src.pipeline.config import (
     LLM_BASE_URL,
     LLM_MODEL_PRIMARY,
     PIPELINE_VERSION,
+    llm_sampling_kwargs,
 )
 
 logger = logging.getLogger(__name__)
@@ -372,13 +373,12 @@ def _llm_extract_effect_measure(published_endpoint: str, full_text: str) -> Extr
         )
         response = client.chat.completions.create(
             model=LLM_MODEL_PRIMARY,
-            temperature=0.0,
-            max_tokens=500,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": _LLM_EXTRACT_SYSTEM},
                 {"role": "user", "content": user},
             ],
+            **llm_sampling_kwargs(1200),
         )
         data = json.loads(response.choices[0].message.content or "{}")
     except Exception as exc:

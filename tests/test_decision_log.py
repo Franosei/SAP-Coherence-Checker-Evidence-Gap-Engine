@@ -84,20 +84,33 @@ class TestDecisionLog:
                 override_reason=None,
             )
 
-    def test_pending_review_returns_correct_rows(self):
-        # An outcome-switch verdict → always pending, however confident.
+    def test_pending_review_returns_correct_rows(self, monkeypatch):
+        # Isolate the routing logic from the spot-check sample.
+        from src.pipeline import validation as _validation
+
+        monkeypatch.setattr(_validation, "select_spot_check_pairs", lambda frame, **k: set())
+        # A confident switch verdict is accepted directly — switch severity is
+        # not, on its own, a reason for review.
         switch = _make_entry("NCT003_PMID003", 0.75, EndpointRouting.LLM)
         switch.llm_switch_type = SwitchType.MAJOR_SWITCH
         switch.llm_confidence = LLMConfidence.HIGH
+        switch.llm_confidence_score = 0.92
         self.log.append(switch)
-        # During recalibration, even a confident non-switch remains pending.
+        # A confident non-switch is likewise accepted directly.
         clean = _make_entry("NCT004_PMID004", 0.97, EndpointRouting.LLM)
         clean.llm_switch_type = SwitchType.CONCORDANT
         clean.llm_confidence = LLMConfidence.HIGH
+        clean.llm_confidence_score = 0.96
         self.log.append(clean)
+        # A low-confidence verdict — the model itself is unsure — stays pending.
+        unsure = _make_entry("NCT005_PMID005", 0.55, EndpointRouting.LLM)
+        unsure.llm_switch_type = SwitchType.MODERATE_SWITCH
+        unsure.llm_confidence = LLMConfidence.LOW
+        unsure.llm_confidence_score = 0.35
+        self.log.append(unsure)
 
         pending = self.log.pending_review()
-        assert list(pending["pair_id"]) == ["NCT003_PMID003", "NCT004_PMID004"]
+        assert list(pending["pair_id"]) == ["NCT005_PMID005"]
 
     def test_unknown_pair_id_raises_keyerror(self):
         with pytest.raises(KeyError):

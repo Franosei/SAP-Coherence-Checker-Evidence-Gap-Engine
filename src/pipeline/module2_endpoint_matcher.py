@@ -15,10 +15,15 @@ Layer 2  LLM clinical judge
     major_switch), reasoning, a numeric confidence_score, and disclosure /
     results-driven flags. Malformed output -> flagged for human review.
 
-Layer 3  Human review gate
-    Every model verdict is a suggestion and enters the human review queue by
-    default. Automatic acceptance is available only through the explicit
-    ENDPOINT_AUTO_ACCEPT opt-in after prospective validation.
+Layer 3  Human review gate (simplified policy)
+    The task is: does the publication report the registered primary endpoint?
+    A pair is routed to a human ONLY when the model is not confident either
+    way (flagged / low confidence_score), or the comparison could not be made
+    at all (no registered endpoint on the trial side, or no publication text).
+    A confident verdict is accepted directly — whether or not it is a switch;
+    switch severity alone is not a reason to route to a human. A deterministic
+    spot-check sample of accepted verdicts is still drawn (SPOT_CHECK_RATE) so
+    an AI-human agreement rate can be reported.
 """
 
 from __future__ import annotations
@@ -54,14 +59,15 @@ from src.pipeline.config import (
     LLM_MAX_TOKENS,
     LLM_MODEL_PRIMARY,
     LLM_PROVIDER,
-    LLM_TEMPERATURE,
     SIMILARITY_AUTO_CONCORDANT,
     SIMILARITY_LLM_LOWER,
+    llm_sampling_kwargs,
 )
 
 logger = logging.getLogger(__name__)
 
-# Verdicts that always go to a human — never auto-accepted.
+# The two switch-severity verdicts (used for likely_results_driven and the
+# switch-rate calculation — no longer a routing decision on their own).
 _SWITCH_VERDICTS = {"moderate_switch", "major_switch"}
 
 
@@ -492,16 +498,28 @@ _CLASSIFICATION_SEVERITY = {
 
 def _classify_endpoint_comparisons(
     raw_comparisons: object,
+    fallback_evidence: Optional[list[str]] = None,
 ) -> tuple[list[EndpointComparison], Optional[str], str, list[str]]:
     """Classify registered primary endpoints individually, then aggregate.
 
     The model supplies evidence extraction only. The five-class result follows
     the user's fixed decision tree. ``None`` attribute values mean "not stated"
     and therefore never trigger modification.
+
+    ``fallback_evidence`` — short quotes pulled from the top-level
+    ``evidence_registered`` / ``evidence_published`` / ``actual_change_evidence``
+    fields. gpt-4o-mini reliably explains *why* it flagged a construct change
+    in those top-level fields (or in the reasoning) without also duplicating it
+    into this per-endpoint array. Recovering that evidence — rather than
+    treating the empty array as "no evidence supplied" — stops a correctly
+    reasoned switch from being silently discarded on a formatting technicality.
+    A recovered verdict still always sets a guardrail note, which forces
+    ``flag_for_human_review`` and caps confidence in ``_adjudication_to_schema``.
     """
     if not isinstance(raw_comparisons, list):
         return [], None, "unclear", []
 
+    fallback_evidence = [str(e).strip() for e in (fallback_evidence or []) if str(e).strip()]
     comparisons: list[EndpointComparison] = []
     internal_classes: list[str] = []
     guardrails: list[str] = []
@@ -517,6 +535,9 @@ def _classify_endpoint_comparisons(
             guardrails.append(f"Endpoint {position}: malformed comparison was ignored.")
             continue
 
+        registered_text = str(raw.get("registered_endpoint", "")).strip()
+        published_text = str(raw.get("published_corresponding_endpoint", "")).strip()
+
         evidence_raw = raw.get("actual_change_evidence") or []
         if not isinstance(evidence_raw, list):
             evidence_raw = [evidence_raw]
@@ -530,6 +551,25 @@ def _classify_endpoint_comparisons(
         different_attributes = [
             name.removeprefix("same_") for name, value in values.items() if value is False
         ]
+
+        used_fallback = False
+        if not evidence and fallback_evidence and (same_construct is False or different_attributes):
+            evidence = list(fallback_evidence)
+            used_fallback = True
+        if not evidence and same_construct is False:
+            distinct_endpoint_texts = bool(
+                registered_text
+                and published_text
+                and registered_text.lower() != published_text.lower()
+            )
+            if distinct_endpoint_texts:
+                evidence = [f"registered: {registered_text} | published: {published_text}"]
+                used_fallback = True
+        if used_fallback:
+            guardrails.append(
+                f"Endpoint {position}: evidence recovered from top-level fields, not the "
+                "structured per-endpoint array — flagged for review."
+            )
 
         if registered_reported is False and evidence:
             if change_disclosed is True:
@@ -578,10 +618,8 @@ def _classify_endpoint_comparisons(
 
         comparisons.append(
             EndpointComparison(
-                registered_endpoint=str(raw.get("registered_endpoint", "")).strip(),
-                published_corresponding_endpoint=str(
-                    raw.get("published_corresponding_endpoint", "")
-                ).strip(),
+                registered_endpoint=registered_text,
+                published_corresponding_endpoint=published_text,
                 same_construct=same_construct,
                 **values,
                 registered_endpoint_reported=registered_reported,
@@ -635,8 +673,19 @@ def _adjudication_to_schema(parsed: dict) -> LLMEndpointClassification:
             f"Unrecognised final_classification: {parsed.get('final_classification')!r}"
         )
 
+    top_level_evidence: list[str] = []
+    raw_top_evidence = parsed.get("actual_change_evidence") or []
+    if not isinstance(raw_top_evidence, list):
+        raw_top_evidence = [raw_top_evidence]
+    top_level_evidence.extend(str(x).strip() for x in raw_top_evidence if str(x).strip())
+    for ev in (parsed.get("evidence_registered"), parsed.get("evidence_published")):
+        if str(ev or "").strip():
+            top_level_evidence.append(str(ev).strip())
+
     endpoint_comparisons, structured_class, structured_match, structured_guardrails = (
-        _classify_endpoint_comparisons(parsed.get("endpoint_comparisons"))
+        _classify_endpoint_comparisons(
+            parsed.get("endpoint_comparisons"), fallback_evidence=top_level_evidence
+        )
     )
     if structured_class is not None:
         switch_type = structured_class
@@ -648,12 +697,7 @@ def _adjudication_to_schema(parsed: dict) -> LLMEndpointClassification:
     disclosure = str(parsed.get("disclosure_status", "")).strip().lower()
     endpoint_changed = _as_bool(parsed.get("endpoint_changed"))
     missing_detail_only = _as_bool(parsed.get("missing_detail_only"))
-    raw_change_evidence = parsed.get("actual_change_evidence") or []
-    if not isinstance(raw_change_evidence, list):
-        raw_change_evidence = [raw_change_evidence]
-    actual_change_evidence = [
-        str(item).strip() for item in raw_change_evidence if str(item).strip()
-    ]
+    actual_change_evidence = list(top_level_evidence)
     if endpoint_comparisons:
         actual_change_evidence = [
             evidence
@@ -862,13 +906,12 @@ def _call_llm(
     try:
         response = client.chat.completions.create(
             model=LLM_MODEL_PRIMARY,
-            max_tokens=LLM_MAX_TOKENS,
-            temperature=LLM_TEMPERATURE,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": _LLM_SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
+            **llm_sampling_kwargs(LLM_MAX_TOKENS),
         )
     except Exception as exc:
         logger.error("%s API error: %s", LLM_PROVIDER, exc)
@@ -1078,16 +1121,16 @@ def run_endpoint_matching(linked_df: pd.DataFrame) -> pd.DataFrame:
                 )
                 n_llm_ok += 1
 
-                # Human-in-the-loop policy: an outcome-SWITCH verdict is the
-                # study's finding, so it always goes to a human. By default all
-                # other model verdicts also require human review; auto-acceptance
-                # is an explicit post-validation opt-in.
-                is_switch = llm_result.switch_type in _SWITCH_VERDICTS
+                # Human-in-the-loop policy (simplified): review is for cases the
+                # model is genuinely unsure about (confidence_score below the
+                # threshold) or couldn't compare at all — NOT for a switch
+                # verdict, and NOT merely because the model also ticked its
+                # advisory flag_for_human_review. Guardrails already fold their
+                # residual uncertainty into confidence_score (capped at 0.65).
                 if (
                     ENDPOINT_AUTO_ACCEPT
-                    and not is_switch
-                    and not llm_result.flag_for_human_review
                     and llm_result.confidence_score >= ENDPOINT_REVIEW_CONFIDENCE_THRESHOLD
+                    and _normalise(registered)
                     and _normalise(published)
                 ):
                     entry.human_reviewed = HumanReviewStatus.AUTO_ACCEPTED

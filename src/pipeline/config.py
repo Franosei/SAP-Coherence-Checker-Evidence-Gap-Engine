@@ -79,20 +79,21 @@ ENDPOINT_MATCHING_LLM_ONLY: bool = os.getenv(
     "ENDPOINT_MATCHING_LLM_ONLY", "true"
 ).strip().lower() not in {"0", "false", "no"}
 
-# Model classifications remain suggestions until the five-class adjudicator is
-# prospectively validated against the human-reviewed gold standard.
-ENDPOINT_AUTO_ACCEPT: bool = os.getenv("ENDPOINT_AUTO_ACCEPT", "false").strip().lower() in {
+# Human-in-the-loop policy for Module 2 verdicts (simplified per user directive,
+# Sept 2026): the task is simple — does the publication report the registered
+# primary endpoint? A human is needed ONLY when the model itself is not
+# confident either way, or the comparison couldn't be made at all (no
+# publication text, or no registered endpoint on the trial side). A confident
+# verdict is accepted directly, WHETHER OR NOT it is a switch — the switch/
+# concordant distinction is not, on its own, a reason to route to a human.
+# A deterministic spot-check sample of confident verdicts is still drawn (see
+# SPOT_CHECK_RATE) so an AI-human agreement rate can be reported.
+ENDPOINT_AUTO_ACCEPT: bool = os.getenv("ENDPOINT_AUTO_ACCEPT", "true").strip().lower() in {
     "1",
     "true",
     "yes",
 }
 
-# Human-in-the-loop policy for Module 2 verdicts:
-#  - An OUTCOME SWITCH (moderate_switch / major_switch) is the study's finding,
-#    so it is NEVER auto-accepted — every switch verdict enters the human queue.
-#  - Every model verdict enters the human review queue by default.
-#  - Automatic acceptance is an explicit opt-in only after prospective
-#    validation; even then, it can never apply to an outcome switch.
 ENDPOINT_REVIEW_CONFIDENCE_THRESHOLD: float = float(
     os.getenv("ENDPOINT_REVIEW_CONFIDENCE_THRESHOLD", "0.5")
 )
@@ -119,14 +120,51 @@ EMBEDDING_COST_PER_1K_USD: float = 0.000_020
 LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openai")
 LLM_MODEL_PRIMARY: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 LLM_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-LLM_MAX_TOKENS: int = 1_024
+# Raised from 1_024 — a reasoning model spends part of this budget on hidden
+# reasoning tokens before the visible JSON, and Module 2's structured
+# endpoint_comparisons schema was already truncating ("Unterminated string")
+# some responses at the old ceiling.
+LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "4096"))
 LLM_TEMPERATURE: float = 0.0
 LLM_COST_CEILING_USD: float = 50.0
 
-# Token cost estimates (USD per 1 000 tokens) for the default gpt-4o-mini.
-# Update these if switching to a different model.
-LLM_COST_PER_1K_INPUT_USD: float = 0.000_150
-LLM_COST_PER_1K_OUTPUT_USD: float = 0.000_600
+# Reasoning effort for reasoning-capable models (o-series, gpt-5 family, ...).
+# Ignored (and not sent) for classic chat models — see LLM_MODEL_IS_REASONING.
+LLM_REASONING_EFFORT: str = os.getenv("LLM_REASONING_EFFORT", "medium")
+
+# Classic chat models (gpt-4*, gpt-3.5*) take `temperature` + `max_tokens` and
+# reject `reasoning_effort`. Reasoning models reject a non-default
+# `temperature`, use `max_completion_tokens` (which also counts hidden
+# reasoning tokens) instead of `max_tokens`, and accept `reasoning_effort`.
+# This is a name-based heuristic — override with LLM_MODEL_IS_REASONING=false
+# in .env if a future non-"gpt-4*/gpt-3*" model turns out not to be one.
+LLM_MODEL_IS_REASONING: bool = os.getenv(
+    "LLM_MODEL_IS_REASONING",
+    "true" if not LLM_MODEL_PRIMARY.lower().startswith(("gpt-4", "gpt-3")) else "false",
+).strip().lower() in {"1", "true", "yes"}
+
+
+def llm_sampling_kwargs(max_output_tokens: int) -> dict:
+    """Provider-correct sampling kwargs for a ``chat.completions.create`` call
+    against ``LLM_MODEL_PRIMARY``. Centralised so every call site (linkage,
+    endpoint adjudication, HR extraction, article classification) stays
+    consistent when the model is switched.
+    """
+    if LLM_MODEL_IS_REASONING:
+        return {
+            "max_completion_tokens": max_output_tokens,
+            "reasoning_effort": LLM_REASONING_EFFORT,
+        }
+    return {"max_tokens": max_output_tokens, "temperature": LLM_TEMPERATURE}
+
+
+# Token cost estimates (USD per 1 000 tokens). Calibrated for gpt-4o-mini —
+# THESE ARE STALE for any other model (including the current LLM_MODEL_PRIMARY
+# if it has been changed) until updated to that model's real published
+# pricing. Cost figures logged/reported by the pipeline are only meaningful
+# once these are corrected.
+LLM_COST_PER_1K_INPUT_USD: float = float(os.getenv("LLM_COST_PER_1K_INPUT_USD", "0.000150"))
+LLM_COST_PER_1K_OUTPUT_USD: float = float(os.getenv("LLM_COST_PER_1K_OUTPUT_USD", "0.000600"))
 
 # ---------------------------------------------------------------------------
 # ClinicalTrials.gov query parameters (Section 3.2.1)

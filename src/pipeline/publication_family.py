@@ -39,7 +39,7 @@ from src.models.schemas import (
     PublicationRole,
     TrialIdentityStatus,
 )
-from src.pipeline.config import LLM_BASE_URL, LLM_MODEL_PRIMARY
+from src.pipeline.config import LLM_BASE_URL, LLM_MODEL_PRIMARY, llm_sampling_kwargs
 from src.pipeline.pubmed_client import PubMedClient, PubMedRecord
 
 logger = logging.getLogger(__name__)
@@ -434,13 +434,12 @@ def _llm_link_trial(row: pd.Series, shortlist: list[_Candidate]) -> Optional[dic
         )
         response = client.chat.completions.create(
             model=LLM_MODEL_PRIMARY,
-            temperature=0.0,
-            max_tokens=1600,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": _LINKAGE_SYSTEM_PROMPT},
                 {"role": "user", "content": user},
             ],
+            **llm_sampling_kwargs(3000),
         )
         return json.loads(response.choices[0].message.content or "{}")
     except Exception as exc:

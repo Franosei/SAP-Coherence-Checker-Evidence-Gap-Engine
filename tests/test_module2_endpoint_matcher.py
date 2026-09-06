@@ -146,9 +146,9 @@ def test_high_cosine_similarity_still_goes_to_the_llm(monkeypatch) -> None:
     assert entry.llm_switch_type == SwitchType.CONCORDANT
 
 
-def test_confident_switch_is_never_auto_accepted(monkeypatch) -> None:
-    """An outcome SWITCH is the study's finding — a human must see every one,
-    however confident and unflagged the LLM is."""
+def test_confident_switch_is_accepted_like_any_other_confident_verdict(monkeypatch) -> None:
+    """Switch severity alone is not a reason for review — only genuine model
+    uncertainty or missing data is (simplified policy)."""
     from src.dashboard.helpers import pending_review_rows
 
     fake_log = _FakeDecisionLog()
@@ -182,17 +182,21 @@ def test_confident_switch_is_never_auto_accepted(monkeypatch) -> None:
     result = matcher.run_endpoint_matching(linked)
 
     entry = fake_log.entries[0]
-    assert entry.human_reviewed.value == "no"
-    assert entry.human_final_class is None
+    assert entry.human_reviewed.value == "auto_accepted"
+    assert entry.human_final_class == SwitchType.MAJOR_SWITCH
     assert entry.llm_confidence_score == 0.92
 
-    # And it DOES appear in the review queue.
+    # And it does NOT appear in the review queue (spot-check sampling disabled
+    # here — a lone auto-accepted row would otherwise always be sampled).
+    from src.pipeline import validation as _validation
+
+    monkeypatch.setattr(_validation, "select_spot_check_pairs", lambda frame, **k: set())
     dl = pd.DataFrame([{**result.iloc[0].to_dict(), **entry.model_dump(mode="json")}])
     dl["llm_flag"] = "False"
-    assert list(pending_review_rows(dl)["pair_id"]) == ["NCT030_777"]
+    assert pending_review_rows(dl).empty
 
 
-def test_confident_non_switch_still_requires_review_during_recalibration(monkeypatch) -> None:
+def test_confident_non_switch_is_also_accepted(monkeypatch) -> None:
     from src.dashboard.helpers import pending_review_rows
 
     fake_log = _FakeDecisionLog()
@@ -226,13 +230,38 @@ def test_confident_non_switch_still_requires_review_during_recalibration(monkeyp
     result = matcher.run_endpoint_matching(linked)
 
     entry = fake_log.entries[0]
-    assert entry.human_reviewed.value == "no"
-    assert entry.human_final_class is None
-    assert entry.human_poolable is None
+    assert entry.human_reviewed.value == "auto_accepted"
+    assert entry.human_final_class == SwitchType.CONCORDANT
+    assert entry.human_poolable is True
 
+    from src.pipeline import validation as _validation
+
+    monkeypatch.setattr(_validation, "select_spot_check_pairs", lambda frame, **k: set())
     dl = pd.DataFrame([{**result.iloc[0].to_dict(), **entry.model_dump(mode="json")}])
     dl["llm_flag"] = "False"
-    assert list(pending_review_rows(dl)["pair_id"]) == ["NCT030_777"]
+    assert pending_review_rows(dl).empty
+
+
+def test_missing_registered_endpoint_forces_review_even_if_confident(monkeypatch) -> None:
+    """The comparison couldn't really be made — always route to a human,
+    regardless of what confidence the model reports."""
+    from src.dashboard.helpers import pending_review_rows
+
+    frame = pd.DataFrame(
+        [
+            {
+                "pair_id": "NCT040_444",
+                "registered_endpoint": "",
+                "published_endpoint": "Overall survival reported at 24 months.",
+                "llm_switch_type": "concordant",
+                "llm_confidence": "high",
+                "llm_confidence_score": "0.95",
+                "llm_flag": "False",
+                "human_reviewed": "no",
+            }
+        ]
+    )
+    assert list(pending_review_rows(frame)["pair_id"]) == ["NCT040_444"]
 
 
 def test_low_confidence_verdict_still_goes_to_the_queue(monkeypatch) -> None:

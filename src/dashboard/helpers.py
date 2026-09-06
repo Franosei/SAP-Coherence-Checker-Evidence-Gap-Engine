@@ -114,10 +114,11 @@ def page_header(title: str, subtitle: str = "") -> ui.Tag:
 def pending_review_rows(frame: pd.DataFrame) -> pd.DataFrame:
     """Pairs still awaiting a human decision, least-confident first.
 
-    The queue is: every outcome-switch verdict + every flagged / low-confidence /
-    missing-endpoint pair + the spot-check sample of the auto-accepted verdicts,
-    minus anything a human has already resolved (see
-    ``validation.pairs_needing_human_review``).
+    The queue is: pairs the model itself was not confident about (flagged / low
+    confidence / no verdict) + pairs missing publication text or a registered
+    endpoint + the spot-check sample of the confidently-accepted verdicts,
+    minus anything a human has already resolved. A confident switch is not, on
+    its own, a reason for review (see ``validation.pairs_needing_human_review``).
     """
     if frame.empty:
         return frame.copy()

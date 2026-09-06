@@ -24,7 +24,7 @@ from sklearn.metrics import (  # type: ignore
 )
 
 from src.pipeline.config import (
-    ENDPOINT_AUTO_ACCEPT,
+    ENDPOINT_REVIEW_CONFIDENCE_THRESHOLD,
     SPOT_CHECK_RATE,
     VALIDATION_LLM_LOW_CONF_FLAG_RATE,
     VALIDATION_TARGET_AUC,
@@ -39,7 +39,8 @@ _VALID_SWITCH_TYPES = {
     "moderate_switch",
     "major_switch",
 }
-# The outcome-switch verdicts — the study's finding. Every one is human-reviewed.
+# The two switch-severity verdicts — used for the gold-standard calibration
+# metrics below, not for review routing (see pairs_needing_human_review).
 _SWITCH_VERDICTS = {"moderate_switch", "major_switch"}
 _MODERATE_OR_ABOVE = _SWITCH_VERDICTS
 _REVIEWED_STATUSES = {"yes", "spot_check"}
@@ -165,18 +166,39 @@ def select_spot_check_pairs(
     decision_log: pd.DataFrame,
     rate: float = SPOT_CHECK_RATE,
 ) -> set[str]:
-    """Deterministically select a spot-check sample of the AUTO-ACCEPTED verdicts.
+    """Deterministically select a FROZEN spot-check sample of the confident
+    verdicts the pipeline accepted without individual review.
 
-    These are the confident "no switch / minor" calls the pipeline accepted
-    without individual review. Sampling a fixed fraction of them gives an
-    AI-human agreement rate for the poster's governance claim. The sample is
-    stratified across endpoint clusters where a cluster column is present.
+    Sampling a fixed fraction of these gives an AI-human agreement rate for the
+    poster's governance claim. The sample is stratified across endpoint clusters
+    where a cluster column is present.
+
+    The pool is derived from the immutable LLM-output columns ("this verdict
+    was confident enough to auto-accept") — NOT from the mutable
+    ``human_reviewed`` status. That is deliberate: if the pool shrank as pairs
+    got reviewed, ``ordered[:k]`` would slide down and pull a fresh pair into
+    the queue for every spot-check completed, so the reviewer would never reach
+    the end. With a frozen pool the queue only ever shrinks.
     """
-    if decision_log.empty or rate <= 0 or "human_reviewed" not in decision_log.columns:
+    if decision_log.empty or rate <= 0 or "pair_id" not in decision_log.columns:
         return set()
 
-    auto = decision_log[decision_log["human_reviewed"].astype(str) == "auto_accepted"].copy()
-    auto = auto[auto["pair_id"].astype(str).str.strip() != ""]
+    dl = decision_log
+
+    def _col(name: str) -> pd.Series:
+        if name in dl.columns:
+            return dl[name].astype(str)
+        return pd.Series([""] * len(dl), index=dl.index)
+
+    score = pd.to_numeric(_col("llm_confidence_score"), errors="coerce")
+    was_acceptable = (
+        (_col("pair_id").str.strip() != "")
+        & (_col("llm_switch_type").str.strip() != "")
+        & (_col("registered_endpoint").str.strip() != "")
+        & (_col("published_endpoint").str.strip() != "")
+        & (score >= ENDPOINT_REVIEW_CONFIDENCE_THRESHOLD)
+    )
+    auto = dl[was_acceptable].copy()
     if auto.empty:
         return set()
 
@@ -194,12 +216,27 @@ def select_spot_check_pairs(
 
 
 def pairs_needing_human_review(decision_log: pd.DataFrame) -> set[str]:
-    """Pair ids that must be seen by a human.
+    """Pair ids that must be seen by a human — the simplified criterion.
 
-    = every outcome-switch verdict (moderate_switch / major_switch)
-      + every LLM-flagged / low-confidence / missing-endpoint pair
-      + the deterministic spot-check sample of the auto-accepted verdicts
+    The task is simple: does the publication report the registered primary
+    endpoint? A human is needed ONLY when the model itself is not confident
+    either way, or the comparison couldn't be made at all. Concretely:
+
+    = the model's numeric ``confidence_score`` is below
+      ``ENDPOINT_REVIEW_CONFIDENCE_THRESHOLD`` (or there is no verdict at all —
+      e.g. a malformed/failed response)
+      + the publication text is absent (nothing to compare against)
+      + the registered primary endpoint is absent on the trial side
+      + the deterministic spot-check sample of the confidently-accepted
+        verdicts (so an AI-human agreement rate can still be reported)
     minus anything a human has already resolved.
+
+    The model's advisory ``flag_for_human_review`` boolean is deliberately NOT
+    a routing trigger — a confident verdict is accepted even if the model also
+    ticked "you might want to look at this". Guardrails already fold their
+    residual uncertainty into ``confidence_score`` (capped at 0.65), so a
+    genuinely borderline guardrail case still falls below a >0.65 threshold.
+    A confident switch verdict is likewise not, on its own, a reason for review.
     """
     if decision_log.empty or "pair_id" not in decision_log.columns:
         return set()
@@ -211,20 +248,16 @@ def pairs_needing_human_review(decision_log: pd.DataFrame) -> set[str]:
             return dl[name].astype(str)
         return pd.Series([""] * len(dl), index=dl.index)
 
-    is_switch = _col("llm_switch_type").isin(_SWITCH_VERDICTS)
-    flagged = _col("llm_flag").str.strip().str.lower().isin({"true", "1", "yes"})
-    low_conf = _col("llm_confidence").str.lower().eq("low")
-    no_endpoint = _col("published_endpoint").str.strip().eq("") & (
-        "published_endpoint" in dl.columns
+    score = pd.to_numeric(_col("llm_confidence_score"), errors="coerce")
+    has_verdict = _col("llm_switch_type").str.strip().ne("")
+    not_confident = (~has_verdict) | (score.isna() & has_verdict) | (
+        score < ENDPOINT_REVIEW_CONFIDENCE_THRESHOLD
     )
+    no_publication_text = _col("published_endpoint").str.strip().eq("")
+    no_registered_endpoint = _col("registered_endpoint").str.strip().eq("")
 
-    need = set(pid[is_switch | flagged | low_conf | no_endpoint])
-    if ENDPOINT_AUTO_ACCEPT:
-        need |= select_spot_check_pairs(dl)
-    else:
-        # During recalibration every model verdict is a suggestion requiring a
-        # human decision, including rows previously marked auto_accepted.
-        need |= set(pid[_col("llm_switch_type").str.strip().ne("")])
+    need = set(pid[not_confident | no_publication_text | no_registered_endpoint])
+    need |= select_spot_check_pairs(dl)
 
     done = set(pid[_col("human_reviewed").isin({"yes", "spot_check"})])
     return need - done

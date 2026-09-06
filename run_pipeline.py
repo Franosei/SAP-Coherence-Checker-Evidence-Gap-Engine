@@ -122,6 +122,15 @@ def parse_args() -> argparse.Namespace:
         help="Stop after Step 2 linkage (no LLM calls).",
     )
     parser.add_argument(
+        "--resume-analysis",
+        action="store_true",
+        help=(
+            "Skip Steps 1-3 entirely. Use the existing matched_trials.csv and "
+            "decision_log.csv (Module 2 + human review already complete) and run "
+            "only HR extraction + Bayesian + power audit + scorecard."
+        ),
+    )
+    parser.add_argument(
         "--skip-bayesian",
         action="store_true",
         help="Stop after Step 4 HR extraction (no Bayesian model).",
@@ -294,7 +303,7 @@ def step2_link_to_pubmed(trials: pd.DataFrame, skip: bool, fresh_run: bool) -> p
     return linked
 
 
-def step3_endpoint_matching(linked: pd.DataFrame) -> pd.DataFrame:
+def step3_endpoint_matching(linked: pd.DataFrame, fresh_run: bool = False) -> pd.DataFrame:
     """
     Step 3 — Endpoint coherence analysis (Module 2).
 
@@ -308,6 +317,26 @@ def step3_endpoint_matching(linked: pd.DataFrame) -> pd.DataFrame:
     are skipped so that an interrupted run can continue.
     """
     already_done = _already_matched()
+
+    # Safety guard: a prior full endpoint-matching run leaves matched_trials.csv
+    # behind. If that exists but the decision log has gone missing/empty, a
+    # blind re-run would silently re-spend hours of LLM calls AND destroy any
+    # human review recorded in the decision log. Refuse unless the operator
+    # explicitly asked for a clean restart with --fresh-run.
+    if not already_done and MATCHED_TRIALS_PATH.exists() and not fresh_run:
+        raise SystemExit(
+            "Step 3 ABORTED — matched_trials.csv exists (a previous endpoint-matching "
+            f"run completed) but the decision log at {DECISION_LOG_PATH} is missing or "
+            "empty. Re-running now would re-spend every LLM call and overwrite any human "
+            "review.\n"
+            "  • If the decision log was lost, restore it (OneDrive version history / "
+            "backup) and re-run.\n"
+            "  • To skip Module 2 and run only the analysis on the existing "
+            "matched_trials.csv + decision log, use --resume-analysis.\n"
+            "  • To deliberately discard everything and re-classify from scratch, use "
+            "--fresh-run."
+        )
+
     if already_done:
         todo = linked[~linked["nct_id"].isin(already_done)].copy()
         logging.info(
@@ -625,28 +654,41 @@ def main() -> None:
 
     max_records: int | None = args.max_trials if args.max_trials > 0 else None
 
-    # ------------------------------------------------------------------ #
-    # Step 1 — Fetch trials from ClinicalTrials.gov                      #
-    # ------------------------------------------------------------------ #
-    trials = step1_fetch_trials(max_records, fresh_run=args.fresh_run)
+    if args.resume_analysis:
+        if not MATCHED_TRIALS_PATH.exists() or not DECISION_LOG_PATH.exists():
+            raise SystemExit(
+                "--resume-analysis needs both matched_trials.csv and decision_log.csv "
+                "to already exist. One is missing — run the pipeline through Step 3 first."
+            )
+        logging.info(
+            "--resume-analysis set. Skipping Steps 1-3; using existing "
+            "matched_trials.csv + decision_log.csv."
+        )
+        trials = pd.read_csv(TRIALS_PATH, dtype=str, keep_default_na=False)
+        linked = pd.read_csv(LINKED_TRIALS_PATH, dtype=str, keep_default_na=False)
+    else:
+        # -------------------------------------------------------------- #
+        # Step 1 — Fetch trials from ClinicalTrials.gov                  #
+        # -------------------------------------------------------------- #
+        trials = step1_fetch_trials(max_records, fresh_run=args.fresh_run)
 
-    # ------------------------------------------------------------------ #
-    # Step 2 — Link each trial to its PubMed publication                 #
-    # ------------------------------------------------------------------ #
-    linked = step2_link_to_pubmed(
-        trials,
-        skip=args.skip_linkage,
-        fresh_run=args.fresh_run,
-    )
+        # -------------------------------------------------------------- #
+        # Step 2 — Link each trial to its PubMed publication            #
+        # -------------------------------------------------------------- #
+        linked = step2_link_to_pubmed(
+            trials,
+            skip=args.skip_linkage,
+            fresh_run=args.fresh_run,
+        )
 
-    if args.skip_matching:
-        logging.info("--skip-matching set. Stopping after Step 2 (linkage).")
-        return
+        if args.skip_matching:
+            logging.info("--skip-matching set. Stopping after Step 2 (linkage).")
+            return
 
-    # ------------------------------------------------------------------ #
-    # Step 3 — Endpoint coherence analysis                               #
-    # ------------------------------------------------------------------ #
-    step3_endpoint_matching(linked)
+        # -------------------------------------------------------------- #
+        # Step 3 — Endpoint coherence analysis                          #
+        # -------------------------------------------------------------- #
+        step3_endpoint_matching(linked, fresh_run=args.fresh_run)
 
     # ------------------------------------------------------------------ #
     # Step 4 — HR / CI extraction from PubMed abstracts                 #

@@ -149,9 +149,11 @@ class DecisionLog:
     def pending_review(self) -> pd.DataFrame:
         """Return rows that require human review but have not yet been actioned.
 
-        The queue is every outcome-switch verdict + every flagged / low-confidence
-        / missing-endpoint pair + the deterministic spot-check sample of the
-        auto-accepted verdicts, minus anything a human has already resolved
+        The queue is: pairs the model itself was not confident about (flagged /
+        low confidence / no verdict) + pairs missing publication text or a
+        registered endpoint + the deterministic spot-check sample of the
+        confidently-accepted verdicts, minus anything a human has already
+        resolved. A confident switch is not, on its own, a reason for review
         (see ``validation.pairs_needing_human_review``).
         """
         df = self.read()
