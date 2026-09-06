@@ -82,7 +82,7 @@ service is not reachable programmatically (HTTP 403). When history is available,
 endpoint comparison uses the latest pre-recruitment snapshot (falling back to the
 original version) and `endpoint_switch_assessable = True`. When it is not, the
 comparison falls back to the **current** registered endpoint (always available
-from the Module 1 fetch) and `endpoint_switch_assessable = False` — a concordant
+from the Module 1 fetch) and `endpoint_switch_assessable = False` a concordant
 result then cannot rule out a quiet registry edit toward the published endpoint,
 and that limitation is recorded per row and carried into the decision log.
 
@@ -141,7 +141,7 @@ omitted / replaced / demoted **and** the change was undisclosed. Its JSON
 `final_classification`, `confidence` 0–1, `disclosure_status`, evidence quotes,
 `reasoning_summary`, …) is mapped deterministically onto the internal
 `switch_type` / `direction` / `confidence_score` / `comparability_for_pooling` /
-`flag_for_human_review` fields — no re-judging in code.
+`flag_for_human_review` fields no re-judging in code.
 
 **Five permitted classifications (v4.5):**
 
@@ -167,13 +167,13 @@ decision log and review dashboard.
 **Human-in-the-loop (simplified, Sept 2026).** The task is simple: does the
 publication report the registered primary endpoint? A pair is routed to a
 human ONLY when the model's numeric `confidence_score` is below
-`ENDPOINT_REVIEW_CONFIDENCE_THRESHOLD` (0.5) — or there is no verdict at all
-(a malformed/failed response) — or the comparison couldn't be made
+`ENDPOINT_REVIEW_CONFIDENCE_THRESHOLD` (0.5) or there is no verdict at all
+(a malformed/failed response) or the comparison couldn't be made
 (no publication text, or no registered primary endpoint on the trial side).
 A verdict at or above the threshold is accepted directly
 (`human_reviewed = "auto_accepted"`) **regardless of switch severity** (a
 confident `major_switch` is accepted like a confident `concordant`) **and
-regardless of the model's advisory `flag_for_human_review` boolean** — a
+regardless of the model's advisory `flag_for_human_review` boolean** a
 confident model that also ticks "you might want to look at this" is still
 trusted. Deterministic guardrails already fold their residual uncertainty
 into `confidence_score` (capped at 0.65), so a genuinely borderline guardrail
@@ -210,14 +210,14 @@ File: `src/pipeline/module3_bayesian.py`
 Random-effects meta-analysis on the trial pairs a human confirmed as poolable
 (`human_poolable = True`). The `(mu, tau)` posterior is computed **exactly** by
 1-D numerical marginalisation on a `tau` grid (mu conjugate-Normal given tau,
-the trial effects integrated out analytically) — no MCMC, no compiled backend,
+the trial effects integrated out analytically) no MCMC, no compiled backend,
 the whole sequential run in ~2 s. `run_sequential_analysis` re-fits one trial at
 a time in registration-date order to show when the evidence crossed clinical
 significance.
 
 **Per-endpoint pooling.** `run_pipeline.step6` fits the model *separately* for
 each endpoint cluster on that cluster's own poolable effect measures. A cluster
-with no poolable effect measure gets no pooled HR (an explicit evidence gap) —
+with no poolable effect measure gets no pooled HR (an explicit evidence gap)
 never a copy of the global posterior.
 
 ### HR / effect-measure extraction
@@ -228,7 +228,7 @@ Regex cascade first (explicit `HR 0.65 (95% CI ...)` forms); on failure an LLM
 reads the full abstract + Results + Conclusion and returns the primary-endpoint
 HR / OR / RR, or reports that no poolable ratio exists (pCR / ORR trials). The
 audit log `data/logs/effect_measure_log.csv` holds **exactly one row per
-trial-publication pair** and is rewritten each run — re-runs cannot duplicate
+trial-publication pair** and is rewritten each run re-runs cannot duplicate
 rows, and pairs already attempted are not re-sent to the LLM.
 
 ### Module 4: Power audit
@@ -239,7 +239,7 @@ File: `src/pipeline/module4_power_audit.py`
   registered enrollment
 - compares it against the Bayesian posterior available at the trial's
   registration date (optimism bias)
-- writes `data/logs/power_audit_log.csv` — one row per trial, rewritten each run
+- writes `data/logs/power_audit_log.csv` one row per trial, rewritten each run
 
 ## Dashboard
 
@@ -374,15 +374,15 @@ Files written by the pipeline:
 - `data/outputs/registry_history.csv`
 - `data/outputs/matched_trials.csv`
 - `data/outputs/effect_measures.json`
-- `data/outputs/scorecard.csv` — one row per endpoint cluster (per-cluster pooled HR)
-- `data/outputs/switching_summary.csv` — outcome-switching characterisation:
+- `data/outputs/scorecard.csv` one row per endpoint cluster (per-cluster pooled HR)
+- `data/outputs/switching_summary.csv` outcome-switching characterisation:
   overall + per-cluster + per-switch-form rates, results-driven fraction,
   disclosed-exploratory count, human-confirmed vs AI-only split, AI–human
   agreement rate
 - `data/logs/linkage_audit_log.csv`
 - `data/logs/decision_log.csv`
-- `data/logs/effect_measure_log.csv` — one row per pair, rewritten each run
-- `data/logs/power_audit_log.csv` — one row per trial, rewritten each run
+- `data/logs/effect_measure_log.csv` one row per pair, rewritten each run
+- `data/logs/power_audit_log.csv` one row per trial, rewritten each run
 
 ## Project structure
 
