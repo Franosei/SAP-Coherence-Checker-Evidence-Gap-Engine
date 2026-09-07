@@ -142,15 +142,10 @@ class HumanReviewStatus(str, Enum):
     YES = "yes"
     NO = "no"
     SPOT_CHECK = "spot_check"
-    # The LLM verdict was confident (confidence_score >= threshold, not flagged)
-    # and was accepted without individual human review. Still auditable and
-    # still subject to the random spot-check sample.
+    # The LLM verdict was confident (confidence_score >= threshold) and was
+    # accepted without individual human review. Still auditable and still
+    # subject to the deterministic spot-check sample.
     AUTO_ACCEPTED = "auto_accepted"
-
-
-# Review states that count as "resolved" — no longer in the human queue,
-# and their human_final_class / human_poolable are used downstream.
-RESOLVED_REVIEW_STATES = ("yes", "spot_check", "auto_accepted")
 
 
 class HumanDecision(str, Enum):

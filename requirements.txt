@@ -18,15 +18,21 @@ openai>=1.30.0
 portalocker>=3.2.0
 
 # Bayesian modelling
-pymc>=5.10.0
+#   Module 3 fits the random-effects model by exact 1-D numerical
+#   marginalisation, not MCMC — PyMC / PyTensor are NOT required (and the
+#   compiled PyTensor backend is blocked by this machine's security policy).
+#   arviz is used only as the InferenceData container.
 arviz>=0.18.0
 
-# Power calculations
+# Power calculations / Wilson intervals
 statsmodels>=0.14.0
 scipy>=1.11.0
 
-# Scorecard metrics
+# Scorecard metrics + calibration
 scikit-learn>=1.4.0
+
+# Figures (make_poster_figures.py)
+matplotlib>=3.8.0
 
 # Dashboard
 plotly>=5.20.0

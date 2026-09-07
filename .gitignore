@@ -206,11 +206,33 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Project-specific: never commit API keys or raw data logs
+# Project-specific: never commit API keys or raw data
 .env
-data/logs/*.csv
-data/logs/bayes_traces/
-# Gold standard may contain real trial data — commit only the empty schema
-# data/gold_standard/gold_standard.csv  ← kept in version control (schema only)
 
-.env.example
+# Audit logs, backups, locks, posterior traces
+data/logs/*.csv
+data/logs/*_bak
+data/logs/*.lock
+data/logs/bayes_traces/
+
+# Generated pipeline outputs (regenerable; contain trial data)
+data/outputs/trials.csv
+data/outputs/linked_trials.csv
+data/outputs/linked_trials.partial.csv
+data/outputs/matched_trials.csv
+data/outputs/publication_family.csv
+data/outputs/registry_history.csv
+data/outputs/effect_measures.json
+data/outputs/scorecard.csv
+data/outputs/switching_summary.csv
+# dated result snapshots
+data/outputs/final_*/
+
+# Poster figures: keep the script + README, not the rendered images
+data/outputs/poster_figures/*.png
+data/outputs/poster_figures/*.pdf
+
+# Gold standard: the blinded template may contain real trial endpoint text.
+# Decide per-project whether to track it; the working copy is not ignored here.
+
+!.env.example
